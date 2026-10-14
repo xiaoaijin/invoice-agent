@@ -13,8 +13,10 @@ from pathlib import Path
 import streamlit as st
 
 # streamlit run 以脚本方式执行，需手动把 src 加入 path
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
+PACKAGE_DIR = Path(__file__).resolve().parents[1]  # src/invoice_agent
+SRC_DIR = PACKAGE_DIR.parent
+SAMPLES_DIR = PACKAGE_DIR / "samples"
+sys.path.insert(0, str(SRC_DIR))
 
 from invoice_agent.config import get_app_config
 from invoice_agent.monitoring.setup import setup_logging
@@ -37,6 +39,55 @@ NODE_LABELS = {
     "finalize": "汇总回答",
     "critic_answer": "回答自评",
 }
+
+CSS = """
+<style>
+    /* 隐藏 Streamlit 原生 chrome */
+    #MainMenu, footer {visibility: hidden;}
+    header[data-testid="stHeader"] {display: none;}
+    .block-container {padding-top: 1.2rem; padding-bottom: 4rem; max-width: 1080px;}
+
+    /* 顶部横幅 */
+    .ia-hero {
+        display: flex; align-items: center; gap: 16px;
+        background: linear-gradient(120deg, #4f46e5 0%, #7c3aed 60%, #9333ea 100%);
+        border-radius: 16px; padding: 20px 28px; color: #fff; margin-bottom: 8px;
+    }
+    .ia-hero-icon {font-size: 40px; line-height: 1;}
+    .ia-hero-title {font-size: 24px; font-weight: 700; letter-spacing: .5px;}
+    .ia-hero-sub {font-size: 13px; opacity: .85; margin-top: 4px;}
+
+    /* 空状态欢迎卡 */
+    .ia-empty {text-align: center; padding: 36px 0 8px;}
+    .ia-empty-emoji {font-size: 52px;}
+    .ia-empty-title {font-size: 22px; font-weight: 700; margin-top: 8px; color: #1e1b4b;}
+    .ia-empty-sub {font-size: 14px; color: #6b7280; margin-top: 6px;}
+
+    /* 侧边栏 */
+    section[data-testid="stSidebar"] {background: #f8f9fe; border-right: 1px solid #e9eaf6;}
+    section[data-testid="stSidebar"] hr {margin: .6rem 0;}
+
+    /* 上传区：柔和虚线框 */
+    [data-testid="stFileUploaderDropzone"] {
+        border-radius: 12px; border: 1.5px dashed #c7cbe2; background: #fafbff;
+    }
+    [data-testid="stFileUploaderDropzone"]:hover {border-color: #6366f1;}
+
+    /* 按钮 */
+    .stButton > button {border-radius: 10px; font-weight: 500;}
+    button[kind="primary"] {box-shadow: 0 2px 10px rgba(79, 70, 229, .28);}
+
+    /* 指标卡 */
+    [data-testid="stMetric"] {
+        background: #fafbff; border: 1px solid #eef0f8;
+        border-radius: 12px; padding: 12px 14px;
+    }
+
+    /* 气泡与状态容器 */
+    [data-testid="stChatMessage"] {padding: .5rem 0;}
+    div[data-testid="stStatusWidget"] {border-radius: 12px;}
+</style>
+"""
 
 
 def ensure_session() -> str:
@@ -90,7 +141,7 @@ def _progress_writer(node: str, handler) -> None:
 
 
 def render_invoice_card(invoice) -> None:
-    st.markdown("### 📋 发票概览")
+    st.markdown("##### 📋 发票概览")
     c1, c2, c3 = st.columns(3)
     c1.metric("发票类型", invoice.invoice_type.value)
     c1.metric("发票号码", invoice.invoice_number)
@@ -122,42 +173,237 @@ def render_invoice_card(invoice) -> None:
         st.warning(f"以下字段置信度较低，请人工核对：{low_conf}")
 
 
-def render_chat_tab() -> None:
-    """多轮对话：历史来自 state（checkpointer 持久化），发票查验后可在对话中追问。"""
-    col1, _ = st.columns([1, 4])
-    with col1:
-        new_chat = st.button("🆕 新对话", help="重置对话记忆与上下文")
-    if new_chat:
-        st.session_state.thread_id = uuid.uuid4().hex
-        st.session_state.chat_display = []
-        st.rerun()
+def render_assistant_turn(idx: int, entry: dict) -> None:
+    """渲染一条助手回复：发票查验结果卡片，或纯问答的回答。"""
+    answer = entry.get("answer")
 
-    thread_id = st.session_state.thread_id
-    display: list[dict] = st.session_state.setdefault("chat_display", [])
+    if entry.get("kind") == "invoice":
+        if entry.get("invoice") is None:
+            st.error(f"❌ 发票识别失败：{answer or '未知错误'}")
+            return
+        render_invoice_card(entry["invoice"])
 
-    # 渲染历史气泡
-    for entry in display[-MAX_DISPLAY_HISTORY:]:
-        with st.chat_message("user" if entry["role"] == "user" else "assistant"):
-            st.markdown(entry["content"])
+        st.markdown("##### 🔍 验真结果")
+        ver = entry.get("verification")
+        if ver is not None:
+            if ver.status == "PASS":
+                st.success(f"✔ 查验通过（{ver.provider}）— {ver.message}")
+            elif ver.status == "FAIL":
+                st.error(f"✘ 查验不符（{ver.provider}）— {ver.message}")
+            else:
+                st.warning(f"? 查验异常（{ver.provider}）— {ver.message}")
+            st.caption("⚠️ 当前为 Mock 验真，结果不代表真实真伪")
 
-    if question := st.chat_input('输入问题（支持追问，如"那出租车票呢？"）'):
-        display.append({"role": "user", "content": question})
-        with st.chat_message("user"):
-            st.markdown(question)
-        with st.chat_message("assistant"):
-            with st.status("思考中…", expanded=False) as status:
-                state, handler = run_graph(None, question, thread_id, progress_cb=_progress_writer)
+        st.markdown("##### 🔁 查重结果")
+        dups = entry.get("dups") or []
+        if dups:
+            st.warning(f"检测到 {len(dups)} 条疑似重复报销记录")
+            for d in dups:
+                st.markdown(
+                    f"- 发票号 `{d.invoice_number}`（{d.invoice_date}，¥{d.total_amount:,.2f}）"
+                    f"已于 {d.first_submitted_at:%Y-%m-%d %H:%M} 提交，状态：**{d.status}**"
+                )
+        else:
+            st.success("台账中无重复记录")
+
+        st.markdown("##### 🛡 风控预警")
+        findings = entry.get("findings") or []
+        if findings:
+            for f in findings:
+                icon = {"高": "🔴", "中": "🟡", "低": "🔵"}[f.level.value]
+                with st.container(border=True):
+                    st.markdown(f"{icon} **[{f.level.value}] {f.rule_id} {f.rule_name}**")
+                    st.write(f.message)
+        else:
+            st.success("未触发风控规则")
+
+    if answer:
+        if entry.get("kind") != "invoice":
+            st.markdown("##### 💬 回答")
+        else:
+            st.markdown("##### 📝 综合结论")
+        st.markdown(answer)
+    if entry.get("rag_chunks"):
+        with st.expander("查看检索到的政策条款"):
+            for c in entry["rag_chunks"]:
+                article = c.article_no or ""
+                st.markdown(f"**《{c.source}》{c.doc_title} {article}**（score={c.score}）")
+                st.text(c.text[:300])
+
+    if entry.get("kind") == "invoice" and entry.get("invoice") is not None:
+        st.divider()
+        inv = entry["invoice"]
+        if entry.get("submitted"):
+            st.success("✔ 已写入报销台账，重复报销检测即刻生效")
+        elif st.button("✅ 确认提交报销（写入台账）", key=f"submit_{idx}", type="primary"):
+            import hashlib
+
+            sha = hashlib.sha256(Path(entry["file_path"]).read_bytes()).hexdigest()
+            DedupStore(get_app_config().db_path).save_reimbursement(
+                invoice_number=inv.invoice_number,
+                invoice_code=inv.invoice_code,
+                seller_tax_id=inv.seller_tax_id,
+                buyer_tax_id=inv.buyer_tax_id,
+                total_amount=inv.total_amount,
+                invoice_date=date.fromisoformat(str(inv.invoice_date)),
+                file_sha256=sha,
+            )
+            entry["submitted"] = True
+            st.rerun()
+
+
+def render_composer() -> None:
+    """统一输入区：上传发票（可选）+ 文字（可选），支持三种组合。"""
+    # 发送后清空输入框：须在下一次 text_area 实例化前消费
+    if st.session_state.pop("_clear_composer", False):
+        st.session_state.pop("composer_text", None)
+    # 示例问题按钮排队填充输入框
+    if prompt := st.session_state.pop("queued_prompt", None):
+        st.session_state["composer_text"] = prompt
+
+    pending = st.session_state.get("pending_file")
+    uploaded = st.file_uploader(
+        "上传发票（可选，图片或 PDF）", type=["png", "jpg", "jpeg", "pdf"], key="_uploader"
+    )
+    if pending and uploaded is None:
+        c1, c2 = st.columns([5, 1])
+        c1.info(f"📎 将使用示例发票：**{pending['name']}**")
+        if c2.button("移除", key="remove_pending"):
+            st.session_state.pop("pending_file", None)
+            st.rerun()
+
+    st.text_area(
+        "问题（可选）",
+        key="composer_text",
+        height=80,
+        placeholder="可只上传发票、只提问，或两者同时。例如：这张发票能报销吗？餐饮部分能抵扣吗？",
+    )
+
+    has_file = pending is not None or uploaded is not None
+    text = (st.session_state.get("composer_text") or "").strip()
+    if has_file and text:
+        mode = "🔎 识票查验 + 💬 政策解答"
+    elif has_file:
+        mode = "🔎 识票查验（识票 · 验真 · 查重 · 风控）"
+    elif text:
+        mode = "💬 政策问答"
+    else:
+        mode = "请上传发票或输入问题"
+
+    c_btn, c_mode = st.columns([1, 3])
+    send = c_btn.button("🚀 发送", type="primary", use_container_width=True,
+                        disabled=not (has_file or text))
+    c_mode.caption(f"将执行：{mode}")
+    st.session_state["_send"] = send
+
+
+def render_empty_state() -> None:
+    st.markdown(
+        """
+        <div class="ia-empty">
+            <div class="ia-empty-emoji">👋</div>
+            <div class="ia-empty-title">你好，我是发票助手</div>
+            <div class="ia-empty-sub">
+                上传发票可自动识票、验真、查重、风控；直接提问可进行政策问答；也可以同时进行。
+                发送后可在对话中继续追问。
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    examples = [
+        "电子发票丢失了还能报销吗？",
+        "餐饮发票的进项税可以抵扣吗？",
+        "增值税专用发票和普通发票报销有什么区别？",
+    ]
+    cols = st.columns(3)
+    for col, ex in zip(cols, examples):
+        if col.button(ex, use_container_width=True):
+            st.session_state["queued_prompt"] = ex
+            st.rerun()
+
+
+def render_conversation_tab(cfg) -> None:
+    display: list[dict] = st.session_state.setdefault("display", [])
+
+    render_composer()
+
+    # 发送处理
+    if st.session_state.pop("_send", False):
+        pending = st.session_state.get("pending_file")
+        payload = None
+        if pending:
+            payload = (pending["bytes"], pending["name"])
+        elif (uploaded := st.session_state.get("_uploader")) is not None:
+            payload = (uploaded.getvalue(), uploaded.name)
+
+        text = (st.session_state.get("composer_text") or "").strip()
+        if payload is None and not text:
+            st.warning("请上传发票或输入问题")
+        else:
+            fpath = None
+            fname = None
+            if payload:
+                data, fname = payload
+                updir = Path(cfg.db_path).parent / "uploads"
+                updir.mkdir(parents=True, exist_ok=True)
+                fpath = updir / f"{uuid.uuid4().hex[:8]}_{fname}"
+                fpath.write_bytes(data)
+
+            display.append({"role": "user", "file_name": fname, "text": text or None})
+            thread_id = st.session_state.thread_id
+            with (
+                st.chat_message("assistant", avatar="🧾"),
+                st.status("处理中…", expanded=True) as status,
+            ):
+                state, handler = run_graph(
+                    str(fpath) if fpath else None,
+                    text or None,
+                    thread_id,
+                    progress_cb=_progress_writer,
+                )
                 done = sum(1 for e in handler.events if e["type"] == "node_end") if handler else 0
-                status.update(label=f"✅ 完成（{done} 个节点）", state="complete")
-            answer = state.get("answer") or "（无回答）"
-            st.markdown(answer)
-            if state.get("rag_chunks"):
-                with st.expander("查看检索到的条款"):
-                    for c in state["rag_chunks"]:
-                        article = c.article_no or ""
-                        st.markdown(f"**《{c.source}》{c.doc_title} {article}**（score={c.score}）")
-                        st.text(c.text[:300])
-        display.append({"role": "assistant", "content": answer})
+                status.update(label=f"完成（{done} 个节点）", state="complete", expanded=False)
+
+            entry: dict = {
+                "role": "assistant",
+                "answer": state.get("answer"),
+                "rag_chunks": state.get("rag_chunks") or [],
+            }
+            if fpath:
+                entry.update(
+                    {
+                        "kind": "invoice",
+                        "invoice": state.get("invoice"),
+                        "verification": state.get("verification"),
+                        "dups": state.get("duplicate_hits") or [],
+                        "findings": state.get("risk_findings") or [],
+                        "file_path": str(fpath),
+                        "submitted": False,
+                    }
+                )
+            else:
+                entry["kind"] = "qa"
+            display.append(entry)
+
+            st.session_state["_clear_composer"] = True
+            st.session_state.pop("pending_file", None)
+            st.rerun()
+
+    # 时间线
+    if not display:
+        render_empty_state()
+        return
+    for i, e in enumerate(display[-MAX_DISPLAY_HISTORY:]):
+        if e["role"] == "user":
+            with st.chat_message("user", avatar="🧑‍💼"):
+                if e.get("file_name"):
+                    st.markdown(f"📎 上传了发票 `{e['file_name']}`")
+                if e.get("text"):
+                    st.markdown(e["text"])
+        else:
+            with st.chat_message("assistant", avatar="🧾"):
+                render_assistant_turn(i, e)
 
 
 def render_monitor_tab() -> None:
@@ -242,101 +488,48 @@ def render_monitor_tab() -> None:
         )
 
 
-def main() -> None:
-    st.title("🧾 发票助手 Agent")
-    st.caption("识票 · 验真 · 风控 · 政策问答 · 多轮对话（验真当前为 Mock，未接真实查验平台）")
+def render_sidebar() -> None:
+    with st.sidebar:
+        st.markdown("## 🧾 发票助手")
+        st.caption("识票 · 验真 · 查重 · 风控 · 政策问答")
+        if st.button("🆕 新对话", use_container_width=True, type="primary"):
+            st.session_state.thread_id = uuid.uuid4().hex
+            st.session_state.display = []
+            st.rerun()
 
-    cfg = get_app_config()
-    thread_id = ensure_session()
-    tab_invoice, tab_ask, tab_monitor = st.tabs(
-        ["📤 发票查验", "💬 政策问答（多轮对话）", "📈 监控面板"]
+        st.divider()
+        st.caption("📚 示例发票（点击后直接发送即可查验）")
+        for p in sorted(SAMPLES_DIR.glob("*.png"))[:8]:
+            if st.button(p.name, key=f"sample_{p.name}", use_container_width=True):
+                st.session_state["pending_file"] = {"name": p.name, "bytes": p.read_bytes()}
+                st.rerun()
+
+        st.divider()
+        st.caption("⚠️ 验真当前为 Mock，未接真实查验平台")
+
+
+def main() -> None:
+    st.markdown(CSS, unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div class="ia-hero">
+            <div class="ia-hero-icon">🧾</div>
+            <div>
+                <div class="ia-hero-title">发票助手</div>
+                <div class="ia-hero-sub">识票 · 验真 · 查重 · 风控 · 政策问答 — 一次输入，全部搞定</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    with tab_invoice:
-        uploaded = st.file_uploader("上传发票（图片或 PDF）", type=["png", "jpg", "jpeg", "pdf"])
-        question = st.text_input(
-            "附加问题（可选）", placeholder="例如：这张发票能报销吗？餐饮部分能抵扣吗？"
-        )
-        if st.button("开始查验", type="primary", disabled=uploaded is None):
-            if uploaded is None:
-                st.error("请先上传发票文件")
-            else:
-                tmp = Path(cfg.db_path).parent / "uploads"
-                tmp.mkdir(parents=True, exist_ok=True)
-                fpath = tmp / uploaded.name
-                fpath.write_bytes(uploaded.getvalue())
-                with st.status("识别与校验中…", expanded=False) as status:
-                    state, handler = run_graph(
-                        str(fpath), question or None, thread_id, progress_cb=_progress_writer
-                    )
-                    done = (
-                        sum(1 for e in handler.events if e["type"] == "node_end") if handler else 0
-                    )
-                    status.update(label=f"✅ 校验完成（{done} 个节点）", state="complete")
-                st.session_state["last_state"] = {
-                    "invoice": state.get("invoice"),
-                    "verification": state.get("verification"),
-                    "dups": state.get("duplicate_hits") or [],
-                    "findings": state.get("risk_findings") or [],
-                    "answer": state.get("answer"),
-                    "file_path": str(fpath),
-                    "invoice_dump": state.get("invoice").model_dump(mode="json")
-                    if state.get("invoice")
-                    else None,
-                }
+    ensure_session()
+    cfg = get_app_config()
+    render_sidebar()
 
-        state = st.session_state.get("last_state")
-        if state:
-            if state["invoice"] is None:
-                st.error(f"发票识别失败：{state.get('answer', '未知错误')}")
-            else:
-                render_invoice_card(state["invoice"])
-
-                ver = state["verification"]
-                st.markdown("### 🔍 验真结果")
-                if ver is not None:
-                    if ver.status == "PASS":
-                        st.success(f"✔ 查验通过（{ver.provider}）— {ver.message}")
-                    elif ver.status == "FAIL":
-                        st.error(f"✘ 查验不符（{ver.provider}）— {ver.message}")
-                    else:
-                        st.warning(f"? 查验异常（{ver.provider}）— {ver.message}")
-                    st.caption("⚠️ 当前为 Mock 验真，结果不代表真实真伪")
-
-                st.markdown("### 🛡 风控预警")
-                if state["findings"]:
-                    for f in state["findings"]:
-                        icon = {"高": "🔴", "中": "🟡", "低": "🔵"}[f.level.value]
-                        with st.container(border=True):
-                            st.markdown(f"{icon} **[{f.level.value}] {f.rule_id} {f.rule_name}**")
-                            st.write(f.message)
-                else:
-                    st.success("未触发风控规则")
-
-                if state["answer"]:
-                    st.markdown("### 📝 综合结论")
-                    st.markdown(state["answer"])
-
-                st.divider()
-                if st.button("✅ 确认提交报销（写入台账）", type="primary"):
-                    inv = state["invoice"]
-                    import hashlib
-
-                    sha = hashlib.sha256(Path(state["file_path"]).read_bytes()).hexdigest()
-                    DedupStore(cfg.db_path).save_reimbursement(
-                        invoice_number=inv.invoice_number,
-                        invoice_code=inv.invoice_code,
-                        seller_tax_id=inv.seller_tax_id,
-                        buyer_tax_id=inv.buyer_tax_id,
-                        total_amount=inv.total_amount,
-                        invoice_date=date.fromisoformat(str(inv.invoice_date)),
-                        file_sha256=sha,
-                    )
-                    st.success("已写入报销台账，重复报销检测即刻生效")
-
-    with tab_ask:
-        render_chat_tab()
-
+    tab_chat, tab_monitor = st.tabs(["💬 助手对话", "📈 监控面板"])
+    with tab_chat:
+        render_conversation_tab(cfg)
     with tab_monitor:
         render_monitor_tab()
 
