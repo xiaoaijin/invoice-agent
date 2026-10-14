@@ -1,34 +1,31 @@
 """retrieve_docs / finalize 节点。
 
-finalize 汇总发票信息/验真/去重/风控/RAG 引用，生成固定结构的 Markdown 回答。
+finalize 职责：
+1. 上下文管理：历史超预算 60% 时压缩（旧对话摘要化、最近 N 轮原样保留）
+2. 组装 prompt（摘要 + 相关长期记忆 + 历史消息 + 本轮上下文），并做预算兜底截断
+3. 汇总发票/验真/去重/风控/RAG 引用，生成固定结构 Markdown 回答
+4. 回答后把本轮问答与工具结果写入记忆（pgvector），摘要持久化
 """
 
 from __future__ import annotations
 
+import logging
+
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
+from invoice_agent.config import get_app_config
 from invoice_agent.graph.state import AgentState
+from invoice_agent.services.context_manager import (
+    compress_history,
+    default_summarizer,
+    estimate_tokens,
+    fit_budget,
+)
 from invoice_agent.services.llm import get_chat_model
 from invoice_agent.services.rag.qa import QA_SYSTEM_PROMPT, format_chunks_for_prompt
 from invoice_agent.services.rag.retriever import get_retriever
 
-MAX_HISTORY_MESSAGES = 8  # 送入 LLM 的历史轮数上限（含双方）
-
-# 疑似追问的开头词：检索 query 需要拼上前一个问题补全语义
-FOLLOW_UP_PREFIXES = ("那", "它", "这个", "这批", "还有", "为什么", "怎么", "如上", "上述")
-
-
-def _last_user_question(state: AgentState) -> str | None:
-    for entry in reversed(state.get("chat_history") or []):
-        if entry.get("role") == "user":
-            return entry.get("content")
-    return None
-
-
-def _is_follow_up(question: str) -> bool:
-    """启发式：短问题或以追问词开头，视为依赖上文。"""
-    q = question.strip()
-    return len(q) <= 15 or q.startswith(FOLLOW_UP_PREFIXES)
+logger = logging.getLogger(__name__)
 
 
 def _build_query(state: AgentState) -> str:
@@ -38,7 +35,11 @@ def _build_query(state: AgentState) -> str:
         parts.append(invoice.summary_text())
     question = state.get("user_question")
     if question:
-        prev = _last_user_question(state)
+        prev = None
+        for entry in reversed(state.get("chat_history") or []):
+            if entry.get("role") == "user":
+                prev = entry.get("content")
+                break
         if prev and prev != question and _is_follow_up(question):
             parts.append(f"用户上一问题：{prev}")
         parts.append(f"用户问题：{question}")
@@ -47,10 +48,16 @@ def _build_query(state: AgentState) -> str:
     return "；".join(parts)
 
 
+def _is_follow_up(question: str) -> bool:
+    """启发式：短问题或以追问词开头，视为依赖上文。"""
+    q = question.strip()
+    return len(q) <= 15 or q.startswith(("那", "它", "这个", "这批", "还有", "为什么", "怎么", "如上", "上述"))
+
+
 def retrieve_docs(state: AgentState) -> dict:
     try:
         retriever = get_retriever()
-    except RuntimeError as exc:  # 索引未建
+    except RuntimeError as exc:  # PG 不可用 / 索引未建
         return {"rag_chunks": [], "extract_error": str(exc)}
     return {"rag_chunks": retriever.retrieve(_build_query(state))}
 
@@ -66,14 +73,13 @@ def _fallback_answer(state: AgentState) -> str:
     return "\n".join(lines)
 
 
-def _history_messages(state: AgentState) -> list:
-    """最近若干轮对话 → LangChain 消息（不含当前轮）。"""
-    history = state.get("chat_history") or []
-    # 当前问题已在 state 中，历史里最后一条 user 若与之相同则跳过（防重放）
-    recent = history[-MAX_HISTORY_MESSAGES:]
+def _history_messages(history: list[dict]) -> list:
+    """历史条目 → LangChain 消息。工具条目渲染为一行「[工具 x] 结果」。"""
     messages: list = []
-    for entry in recent:
-        if entry.get("role") == "user":
+    for entry in history:
+        if entry.get("role") == "tool":
+            messages.append(HumanMessage(content=f"[工具 {entry.get('tool', '?')}] {entry.get('content', '')}"))
+        elif entry.get("role") == "user":
             messages.append(HumanMessage(content=entry.get("content", "")))
         else:
             messages.append(AIMessage(content=entry.get("content", "")))
@@ -81,30 +87,113 @@ def _history_messages(state: AgentState) -> list:
 
 
 def _remember(state: AgentState, question: str | None, answer: str) -> list[dict]:
-    """把本轮问答追加进对话历史（返回完整新列表，checkpointer 按覆盖合并）。"""
+    """本轮问答 + 工具结果写入历史（返回完整新列表，checkpointer 按覆盖合并）。"""
     history = list(state.get("chat_history") or [])
     if question:
         history.append({"role": "user", "content": question})
-    history.append({"role": "assistant", "content": answer})
+    # 工具调用只保留工具名和调用结果
+    verification = state.get("verification")
+    if verification is not None:
+        history.append(
+            {"role": "tool", "tool": "invoice_verify", "content": f"{verification.status}: {verification.message}"}
+        )
+    findings = state.get("risk_findings") or []
+    if findings or state.get("invoice") is not None:
+        tool_summary = (
+            "; ".join(f"{f.rule_id}({f.level.value})" for f in findings) if findings else "无风险"
+        )
+        history.append({"role": "tool", "tool": "risk_rules", "content": tool_summary})
+    if answer:
+        history.append({"role": "assistant", "content": answer})
     return history
 
 
 def finalize(state: AgentState) -> dict:
     invoice = state.get("invoice")
+    cfg = get_app_config()
+
+    # ---- 上下文压缩（历史超预算 60% 时触发）----
+    compression = compress_history(state, default_summarizer(), cfg.context)
+    history: list[dict] = compression.get("chat_history") or list(state.get("chat_history") or [])
+    summary = compression.get("history_summary") or state.get("history_summary") or ""
+
     # 识票路径但提取失败且重试耗尽 → 降级人工复核（不走 LLM）
     if invoice is None and state.get("file_path"):
         answer = _fallback_answer(state)
-        return {"answer": answer, "chat_history": _remember(state, state.get("user_question"), answer)}
+        return {
+            "answer": answer,
+            "chat_history": _remember(state, state.get("user_question"), answer),
+            "history_summary": summary,
+        }
     # 兜底：无票无问题
     if invoice is None and not state.get("user_question"):
-        return {"answer": "请上传发票图片/PDF 或输入政策问题。"}
+        return {"answer": "请上传发票图片/PDF 或输入政策问题。", "chat_history": history, "history_summary": summary}
 
+    # ---- 长期记忆（pgvector）：语义召回相关历史问答 ----
+    recalled: list[dict] = []
+    if state.get("user_question"):
+        try:
+            from invoice_agent.services.memory_store import get_memory_store
+
+            recalled = get_memory_store().recall(
+                state["user_question"], top_k=cfg.memory.recall_top_k
+            )
+        except Exception as exc:  # noqa: BLE001 — 记忆是增强项，失败不阻塞
+            logger.warning("长期记忆召回失败（忽略）：%s", exc)
+
+    # ---- 组装 prompt ----
     context_parts = []
+    if summary:
+        context_parts.append(f"## 早期对话摘要\n{summary}")
+    if recalled:
+        mem_lines = [f"- {m['content'][:300]}（相关度 {m['score']:.2f}）" for m in recalled]
+        context_parts.append("## 相关历史记忆（语义召回）\n" + "\n".join(mem_lines))
     if invoice is not None:
-        verification = state.get("verification")
-        findings = state.get("risk_findings") or []
-        dups = state.get("duplicate_hits") or []
-        invoice_block = f"""## 发票结构化数据
+        context_parts.append(_invoice_block(state, invoice))
+    chunks = state.get("rag_chunks") or []
+    context_parts.append("## 参考条款（检索结果）\n\n" + format_chunks_for_prompt(chunks))
+    if state.get("user_question"):
+        context_parts.append(f"## 用户问题\n{state['user_question']}")
+
+    prompt_text = "\n\n".join(context_parts) + (
+        "\n\n请按以下结构输出 Markdown：发票概览 / 验真结论 / 重复性 / 风险提示 / 政策依据（[来源N] 引用列表）。"
+        "无发票时只回答政策问题。结合对话历史理解追问（如\"那出租车票呢\"指上一问题中的票据类型）。"
+    )
+    # 预算兜底：完整 prompt 超上限时从头截断
+    prompt_text = fit_budget(prompt_text, cfg.context.token_budget)
+
+    messages = [
+        SystemMessage(content=QA_SYSTEM_PROMPT),
+        *_history_messages(history),
+        HumanMessage(content=prompt_text),
+    ]
+    try:
+        answer = get_chat_model().invoke(messages).content
+    except Exception as exc:  # noqa: BLE001
+        answer = _fallback_answer(state) + f"\n\n（LLM 汇总失败：{exc}）"
+
+    # ---- 记忆写入（pgvector，尽力而为）----
+    question = state.get("user_question")
+    new_history = _remember(state, question, answer)
+    try:
+        from invoice_agent.services.memory_store import get_memory_store
+
+        memory = get_memory_store()
+        if question and answer:
+            memory.record_turn(state.get("session_id", "default"), question, answer)
+        if compression.get("history_summary"):
+            memory.save_summary(state.get("session_id", "default"), compression["history_summary"])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("记忆写入失败（忽略）：%s", exc)
+
+    return {"answer": answer, "chat_history": new_history, "history_summary": summary}
+
+
+def _invoice_block(state: AgentState, invoice) -> str:
+    verification = state.get("verification")
+    findings = state.get("risk_findings") or []
+    dups = state.get("duplicate_hits") or []
+    return f"""## 发票结构化数据
 ```json
 {invoice.model_dump_json(indent=2)}
 ```
@@ -119,24 +208,7 @@ def finalize(state: AgentState) -> dict:
 
 ## 风控预警
 {chr(10).join(f"- [{f.level.value}] {f.rule_id} {f.rule_name}：{f.message}" for f in findings) if findings else "未触发风控规则。"}"""
-        context_parts.append(invoice_block)
 
-    chunks = state.get("rag_chunks") or []
-    context_parts.append("## 参考条款（检索结果）\n\n" + format_chunks_for_prompt(chunks))
 
-    if state.get("user_question"):
-        context_parts.append(f"## 用户问题\n{state['user_question']}")
-
-    messages = [
-        SystemMessage(content=QA_SYSTEM_PROMPT),
-        *_history_messages(state),
-        HumanMessage(
-            content="\n\n".join(context_parts)
-            + "\n\n请按以下结构输出 Markdown：发票概览 / 验真结论 / 重复性 / 风险提示 / 政策依据（[来源N] 引用列表）。无发票时只回答政策问题。结合对话历史理解追问（如\"那出租车票呢\"指上一问题中的票据类型）。"
-        ),
-    ]
-    try:
-        answer = get_chat_model().invoke(messages).content
-    except Exception as exc:  # noqa: BLE001
-        answer = _fallback_answer(state) + f"\n\n（LLM 汇总失败：{exc}）"
-    return {"answer": answer, "chat_history": _remember(state, state.get("user_question"), answer)}
+# estimate_tokens 暴露给测试/调试
+__all__ = ["estimate_tokens", "finalize", "retrieve_docs"]

@@ -39,7 +39,6 @@ def _patch_env(monkeypatch, tmp_path: Path, llm_answer: str = "OK") -> None:
         risk=RiskConfig(),
         paths=PathsConfig(
             db=str(tmp_path / "m.db"),
-            chroma_dir=str(tmp_path / "chroma"),
             knowledge_dir=str(tmp_path / "knowledge"),
         ),
     )
@@ -131,15 +130,15 @@ class TestMemory:
         assert "能报销吗" in q
 
     def test_history_messages_format(self):
-        state = {
-            "chat_history": [
-                {"role": "user", "content": "q1"},
-                {"role": "assistant", "content": "a1"},
-                {"role": "user", "content": "q2"},
-                {"role": "assistant", "content": "a2"},
-            ]
-        }
-        msgs = answer_mod._history_messages(state)
-        assert len(msgs) == 4
+        history = [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "tool", "tool": "invoice_verify", "content": "PASS: ok"},
+            {"role": "user", "content": "q2"},
+            {"role": "assistant", "content": "a2"},
+        ]
+        msgs = answer_mod._history_messages(history)
+        assert len(msgs) == 5
         assert msgs[0].content == "q1" and type(msgs[0]).__name__ == "HumanMessage"
         assert msgs[1].content == "a1" and type(msgs[1]).__name__ == "AIMessage"
+        assert "[工具 invoice_verify] PASS: ok" in msgs[2].content

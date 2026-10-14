@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     model_chat: str = "qwen-max"
     embedding_model: str = "text-embedding-v3"
     verify_provider: str = "mock"
+    pg_dsn: str = "postgresql://invoice:invoice@localhost:5432/invoice_agent"
 
     model_config = SettingsConfigDict(
         env_file=str(PROJECT_ROOT / ".env"),
@@ -42,6 +43,21 @@ class RiskConfig(BaseModel):
     sensitive_keywords: list[str] = Field(default_factory=list)
 
 
+class ContextConfig(BaseModel):
+    """单次 LLM 交互的上下文预算与压缩策略。"""
+
+    token_budget: int = 8000  # 单次交互 token 上限（字符估算）
+    compress_threshold: float = 0.6  # 历史达到预算的 60% 时触发摘要压缩
+    keep_recent_rounds: int = 10  # 压缩时原样保留的最近轮数（更早的进摘要）
+
+
+class MemoryConfig(BaseModel):
+    """pgvector 长期记忆召回参数。"""
+
+    recall_top_k: int = 5
+    enabled: bool = True  # PG 不可用时自动降级，此开关用于彻底关闭
+
+
 class CompanyConfig(BaseModel):
     name: str
     tax_id: str
@@ -49,13 +65,14 @@ class CompanyConfig(BaseModel):
 
 class PathsConfig(BaseModel):
     db: str = "data/invoice_agent.db"
-    chroma_dir: str = "data/chroma"
     knowledge_dir: str = "knowledge"
 
 
 class AppConfig(BaseModel):
     company: CompanyConfig
     risk: RiskConfig
+    context: ContextConfig = ContextConfig()
+    memory: MemoryConfig = MemoryConfig()
     paths: PathsConfig
 
     def resolve(self, rel: str) -> Path:
@@ -66,10 +83,6 @@ class AppConfig(BaseModel):
     @property
     def db_path(self) -> Path:
         return self.resolve(self.paths.db)
-
-    @property
-    def chroma_dir(self) -> Path:
-        return self.resolve(self.paths.chroma_dir)
 
     @property
     def knowledge_dir(self) -> Path:

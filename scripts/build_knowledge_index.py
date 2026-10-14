@@ -23,8 +23,8 @@ def main() -> int:
     def embed_fn(texts: list[str]) -> list[list[float]]:
         return get_embedding_model().embed_documents(texts)
 
-    n = build_index(cfg.knowledge_dir, cfg.chroma_dir, embed_fn)
-    print(f"索引构建完成：{n} 个知识块 → {cfg.chroma_dir}")
+    n = build_index(cfg.knowledge_dir, embed_fn)
+    print(f"索引构建完成：{n} 个知识块 → PostgreSQL (pgvector)")
     return 0
 
 

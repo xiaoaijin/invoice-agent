@@ -1,53 +1,39 @@
-"""索引：嵌入写入 Chroma + BM25 语料落盘 JSON。
+"""索引：知识库切分 → 嵌入 → 写入 PostgreSQL (pgvector)。
 
-BM25 语料（chunk 全文+元数据）存 data/chroma 同级 JSON，进程启动时内存构建。
+原 Chroma 方案已迁移至 pgvector，与长期记忆共用一个 PostgreSQL 实例。
 """
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
-import chromadb
-
+from invoice_agent.services.pg import connect, init_schema, to_vector_literal
 from invoice_agent.services.rag.chunking import split_documents
 from invoice_agent.services.rag.loaders import load_documents
 
-CORPUS_FILENAME = "bm25_corpus.json"
 
-
-def build_index(knowledge_dir: Path, chroma_dir: Path, embed_fn) -> int:
-    """构建向量索引 + BM25 语料。embed_fn: list[str] -> list[list[float]]。"""
+def build_index(knowledge_dir: Path, embed_fn) -> int:
+    """重建知识库索引（全量替换）。embed_fn: list[str] -> list[list[float]]。"""
     docs = load_documents(knowledge_dir)
     chunks = split_documents(docs)
     if not chunks:
         raise RuntimeError(f"知识库为空：{knowledge_dir}")
 
-    chroma_dir.mkdir(parents=True, exist_ok=True)
-    client = chromadb.PersistentClient(path=str(chroma_dir))
-    # 重建：避免旧向量污染
-    for name in client.list_collections():
-        if name.name == "knowledge":
-            client.delete_collection("knowledge")
-    col = client.get_or_create_collection("knowledge", metadata={"hnsw:space": "cosine"})
-
-    texts = [c["text"] for c in chunks]
-    embeddings = embed_fn(texts)
-    col.add(
-        ids=[f"chunk_{i}" for i in range(len(chunks))],
-        documents=texts,
-        embeddings=embeddings,
-        metadatas=[
-            {
-                "source": c["source"],
-                "doc_title": c["doc_title"],
-                "article_no": c["article_no"] or "",
-            }
-            for c in chunks
-        ],
-    )
-
-    (chroma_dir / CORPUS_FILENAME).write_text(
-        json.dumps(chunks, ensure_ascii=False), encoding="utf-8"
-    )
+    init_schema()
+    embeddings = embed_fn([c["text"] for c in chunks])
+    with connect() as conn:
+        conn.execute("DELETE FROM knowledge_chunks")
+        for i, (chunk, vec) in enumerate(zip(chunks, embeddings, strict=True)):
+            conn.execute(
+                "INSERT INTO knowledge_chunks (id, source, doc_title, article_no, content, embedding) "
+                "VALUES (%s, %s, %s, %s, %s, %s::vector)",
+                (
+                    f"chunk_{i}",
+                    chunk["source"],
+                    chunk["doc_title"],
+                    chunk["article_no"] or "",
+                    chunk["text"],
+                    to_vector_literal(vec),
+                ),
+            )
     return len(chunks)

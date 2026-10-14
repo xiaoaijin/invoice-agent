@@ -30,7 +30,7 @@ def make_invoice(**kw) -> InvoiceData:
 
 
 def _patch_config(monkeypatch, tmp_path: Path) -> None:
-    """把各节点引用的 get_app_config 指向临时 SQLite/Chroma 路径（真实 AppConfig 结构）。"""
+    """把各节点引用的 get_app_config 指向临时 SQLite 路径（真实 AppConfig 结构）。"""
     from invoice_agent.config import AppConfig, CompanyConfig, PathsConfig, RiskConfig
 
     fake_cfg = AppConfig(
@@ -38,7 +38,6 @@ def _patch_config(monkeypatch, tmp_path: Path) -> None:
         risk=RiskConfig(),
         paths=PathsConfig(
             db=str(tmp_path / "g.db"),
-            chroma_dir=str(tmp_path / "chroma"),
             knowledge_dir=str(tmp_path / "knowledge"),
         ),
     )

@@ -33,4 +33,5 @@ class AgentState(TypedDict, total=False):
     answer: str | None  # 最终回答（Markdown）
 
     # 多轮对话记忆（checkpointer 按 thread_id 持久化整个 state）
-    chat_history: list[dict]  # [{"role": "user"|"assistant", "content": str}]
+    chat_history: list[dict]  # [{"role": "user"|"tool"|"assistant", "content": str}]
+    history_summary: str  # 压缩产生的早期对话滚动摘要

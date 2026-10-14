@@ -21,5 +21,13 @@ risk:
 
 paths:
   db: "data/invoice_agent.db"
-  chroma_dir: "data/chroma"
   knowledge_dir: "knowledge"
+
+context:
+  token_budget: 8000          # 单次 LLM 交互 token 上限（字符估算）
+  compress_threshold: 0.6     # 历史 token 达预算 60% 时触发摘要压缩
+  keep_recent_rounds: 10      # 压缩时原样保留最近 N 轮，更早的进摘要
+
+memory:
+  enabled: true               # PG 不可用时自动降级为无长期记忆
+  recall_top_k: 5             # 语义召回相关历史记忆条数
