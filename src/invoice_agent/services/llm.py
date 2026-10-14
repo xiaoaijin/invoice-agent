@@ -43,4 +43,7 @@ def get_embedding_model() -> OpenAIEmbeddings:
         model=s.embedding_model,
         api_key=require_api_key(),
         base_url=s.llm_base_url,
+        # DashScope 兼容端点只接受字符串数组，不接受 langchain 默认的 token 数组
+        check_embedding_ctx_length=False,
+        chunk_size=10,  # DashScope 嵌入接口单批上限 20 条
     )
