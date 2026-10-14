@@ -26,6 +26,9 @@ uv sync
 
 # 3. 启动 PostgreSQL (pgvector)——知识库 RAG 与长期记忆存储
 docker compose up -d
+# 无 Docker 环境可用 scripts/local_pg.py（pgserver 自包含二进制，免装 Docker/编译）：
+uv pip install --default-index https://pypi.tuna.tsinghua.edu.cn/simple pgserver
+uv run --no-sync python scripts/local_pg.py
 
 # 4. 配置 API Key
 cp .env.example .env   # 编辑 .env，填入 DASHSCOPE_API_KEY（PG_DSN 默认连本地 docker 实例）
@@ -43,7 +46,9 @@ uv run python scripts/build_knowledge_index.py
 uv run streamlit run src/invoice_agent/ui/app.py
 ```
 
-> 没有docker/PostgreSQL？应用仍可运行：RAG 与长期记忆自动降级（问答无引用、无跨会话记忆），其余功能不受影响。
+> 没有 Docker/PostgreSQL？应用仍可运行：RAG 与长期记忆自动降级（问答无引用、无跨会话记忆），其余功能不受影响。
+>
+> `scripts/local_pg.py` 说明：数据目录在项目内 `.pgdata/`（已 gitignore）；幂等可重复执行，进程退出后 PG 保持常驻；停止用 `pg_ctl -D .pgdata stop`。机器无法直连 pypi.org 时，安装 pgserver 需走清华镜像（见上方命令）。
 
 CLI 调试：
 
