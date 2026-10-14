@@ -1,14 +1,13 @@
 """LangGraph 状态图组装。
 
 流程：
-START → intake → route_entry ─┬─ 有文件 → recognize → check_extract ─┬─ 通过 → verify → dedup → risk ─┐
-                              │                                      ├─ 失败重试 → recognize           │
-                              │                                      └─ 失败降级 ──────────────────────┤
-                              └─ 仅提问 → retrieve_docs ──────────────────────────────────────────────┤
-                                       ↓                                                              │
-                                    retrieve_docs ←────────────────────────────────────────────────────┘
+START → intake → route_entry ─┬─ 有文件 → recognize ⇄ check_extract（失败重试/降级）┐
+                              │                                                  ├→ verify → dedup → risk → risk_review ┐
+                              └─ 仅提问 → retrieve_docs ─────────────────────────┘                                       │
+                                       ↓                                                                                 │
+                                    retrieve_docs ←──────────────────────────────────────────────────────────────────────┘
                                        ↓
-                                    finalize → END
+                                    finalize ⇄ critic_answer（自评不通过带反馈重生成，有界） → END
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ from functools import lru_cache
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
-from invoice_agent.graph.nodes import answer, dedup, intake, recognize, risk, route, verify
+from invoice_agent.graph.nodes import answer, critic, dedup, intake, recognize, risk, route, verify
 from invoice_agent.graph.state import AgentState
 
 
@@ -31,8 +30,10 @@ def build_graph():
     g.add_node("verify", verify.verify)
     g.add_node("dedup", dedup.dedup)
     g.add_node("risk", risk.risk)
+    g.add_node("risk_review", critic.risk_review)
     g.add_node("retrieve_docs", answer.retrieve_docs)
     g.add_node("finalize", answer.finalize)
+    g.add_node("critic_answer", critic.critic_answer)
 
     g.add_edge(START, "intake")
     g.add_conditional_edges(
@@ -48,8 +49,15 @@ def build_graph():
     )
     g.add_edge("verify", "dedup")
     g.add_edge("dedup", "risk")
-    g.add_edge("risk", "retrieve_docs")
+    g.add_edge("risk", "risk_review")
+    g.add_edge("risk_review", "retrieve_docs")
     g.add_edge("retrieve_docs", "finalize")
-    g.add_edge("finalize", END)
+    # 回答自评：不通过 → finalize 带反馈重生成（有界）；通过/耗尽 → END
+    g.add_conditional_edges(
+        "critic_answer",
+        route.route_after_critique,
+        {"finalize": "finalize", "END": END},
+    )
+    g.add_edge("finalize", "critic_answer")
 
     return g.compile(checkpointer=MemorySaver())

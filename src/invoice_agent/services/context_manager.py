@@ -50,9 +50,7 @@ def _split_keep_window(history: list[dict], keep_rounds: int) -> tuple[list[dict
     return history[:split_at], history[split_at:]
 
 
-def compress_history(
-    state: dict, summarize_fn, config: ContextConfig
-) -> dict:
+def compress_history(state: dict, summarize_fn, config: ContextConfig) -> dict:
     """历史 token 超过预算 60% 时压缩：旧内容摘要、最近 N 轮原样保留。
 
     summarize_fn(prev_summary: str, old_entries: list[dict]) -> str
@@ -71,7 +69,10 @@ def compress_history(
     summary = summarize_fn(prev_summary, old)
     logger.info(
         "上下文压缩触发：历史 %d 条（~%d tokens）→ 摘要 %d 字 + 保留 %d 条",
-        len(history), history_tokens(history), len(summary), len(recent),
+        len(history),
+        history_tokens(history),
+        len(summary),
+        len(recent),
     )
     return {"chat_history": recent, "history_summary": summary}
 

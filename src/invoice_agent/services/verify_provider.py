@@ -41,9 +41,7 @@ class MockInvoiceVerifyProvider(InvoiceVerifyProvider):
         # 1. 格式校验
         n = invoice.invoice_number.strip()
         if len(n) not in (8, 20) or not n.isdigit():
-            return self._result(
-                "FAIL", f"发票号码格式异常（{n}）：应为 8 位或 20 位数字"
-            )
+            return self._result("FAIL", f"发票号码格式异常（{n}）：应为 8 位或 20 位数字")
         for tax_id, label in ((invoice.buyer_tax_id, "购买方"), (invoice.seller_tax_id, "销售方")):
             if tax_id and not (15 <= len(tax_id.strip()) <= 20):
                 return self._result("FAIL", f"{label}税号格式异常（{tax_id}）：应为 15~20 位")

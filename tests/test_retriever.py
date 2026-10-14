@@ -7,7 +7,9 @@ from invoice_agent.services.rag.retriever import FINAL_TOP_K, rrf_fuse
 
 
 def chunk(source: str, text: str, article: str | None = None, score: float = 0.0) -> RetrievedChunk:
-    return RetrievedChunk(source=source, doc_title=source, article_no=article, text=text, score=score)
+    return RetrievedChunk(
+        source=source, doc_title=source, article_no=article, text=text, score=score
+    )
 
 
 class TestRRFFuse:

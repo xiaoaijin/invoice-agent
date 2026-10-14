@@ -15,7 +15,11 @@ def format_chunks_for_prompt(chunks) -> str:
         return "（未检索到相关条款）"
     parts = []
     for i, c in enumerate(chunks, 1):
-        article = f"第{c.article_no}" if c.article_no and not c.article_no.startswith("第") else (c.article_no or "")
+        article = (
+            f"第{c.article_no}"
+            if c.article_no and not c.article_no.startswith("第")
+            else (c.article_no or "")
+        )
         head = f"[来源{i}] 《{c.source}》{c.doc_title}{article}"
         parts.append(f"{head}\n{c.text}")
     return "\n\n---\n\n".join(parts)

@@ -36,9 +36,13 @@ class TestDedupStore:
     def test_recent_by_seller(self, tmp_path: Path):
         store = DedupStore(tmp_path / "d.db")
         store.save_reimbursement(
-            invoice_number="20001", invoice_code=None, seller_tax_id="S2",
-            buyer_tax_id=None, total_amount=500.0,
-            invoice_date=date.today(), file_sha256="x",
+            invoice_number="20001",
+            invoice_code=None,
+            seller_tax_id="S2",
+            buyer_tax_id=None,
+            total_amount=500.0,
+            invoice_date=date.today(),
+            file_sha256="x",
         )
         recent = store.find_recent_by_seller("S2", days=7, exclude_number="99999")
         assert len(recent) == 1

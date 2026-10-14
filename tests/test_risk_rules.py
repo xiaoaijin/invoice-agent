@@ -64,8 +64,11 @@ class TestRules:
         ctx = make_ctx(tmp_path)
         ctx["duplicate_hits"] = [
             DuplicateHit(
-                invoice_number="30000001", invoice_date=date(2026, 9, 1),
-                total_amount=113.0, first_submitted_at=date(2026, 9, 2), status="reimbursed",
+                invoice_number="30000001",
+                invoice_date=date(2026, 9, 1),
+                total_amount=113.0,
+                first_submitted_at=date(2026, 9, 2),
+                status="reimbursed",
             )
         ]
         findings = run_risk_rules(make_invoice(), ctx, CONFIG)
@@ -76,8 +79,13 @@ class TestRules:
         store = ctx["dedup_store"]
         # 库内 30000003 与当前 30000001 差 2 ≤ 5 → 连号
         store.save_reimbursement(
-            "30000003", None, "91330100MA28YYYYYY", None, 100.0,
-            date.today() - timedelta(days=1), "sha",
+            "30000003",
+            None,
+            "91330100MA28YYYYYY",
+            None,
+            100.0,
+            date.today() - timedelta(days=1),
+            "sha",
         )
         findings = run_risk_rules(make_invoice(), ctx, CONFIG)
         r003 = [f for f in findings if f.rule_id == "R003"]
@@ -89,8 +97,13 @@ class TestRules:
         # 库内 2 张共 4900，本张 200 → 合计 5100 ≥ 5000 且 3 张 → 拆分
         for num, amount in [("40001", 2800.0), ("40002", 2100.0)]:
             store.save_reimbursement(
-                num, None, "91330100MA28YYYYYY", None, amount,
-                date.today() - timedelta(days=1), "sha",
+                num,
+                None,
+                "91330100MA28YYYYYY",
+                None,
+                amount,
+                date.today() - timedelta(days=1),
+                "sha",
             )
         inv = make_invoice(total_amount=200.0, amount_without_tax=188.68, tax_amount=11.32)
         findings = run_risk_rules(inv, ctx, CONFIG)

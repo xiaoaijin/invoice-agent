@@ -20,3 +20,11 @@ def route_after_extract(state) -> str:
     if retry < 2:
         return "recognize"
     return "finalize"
+
+
+def route_after_critique(state) -> str:
+    """回答自评路由：通过（或重试耗尽已放行）→ END；不通过 → finalize 重生成。"""
+    critique = state.get("critique") or {}
+    if critique.get("passed", True):
+        return "END"
+    return "finalize"

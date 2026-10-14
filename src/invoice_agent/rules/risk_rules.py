@@ -21,7 +21,11 @@ RuleFunc = Callable[[InvoiceData, dict, "AppConfig"], list[Finding]]
 
 
 def _to_date(s: str | date) -> date:
-    return s if isinstance(s, date) else date.fromisoformat(str(s).replace("年", "-").replace("月", "-").replace("日", ""))
+    return (
+        s
+        if isinstance(s, date)
+        else date.fromisoformat(str(s).replace("年", "-").replace("月", "-").replace("日", ""))
+    )
 
 
 def rule_r001_buyer_mismatch(invoice, ctx, config) -> list[Finding]:
@@ -133,11 +137,7 @@ def rule_r004_split(invoice, ctx, config) -> list[Finding]:
 def rule_r005_sensitive(invoice, ctx, config) -> list[Finding]:
     """R005 敏感商品：明细命中词表。"""
     keywords = config.risk.sensitive_keywords
-    hits = [
-        item.name
-        for item in invoice.items
-        if any(kw in item.name for kw in keywords)
-    ]
+    hits = [item.name for item in invoice.items if any(kw in item.name for kw in keywords)]
     if not hits:
         return []
     return [

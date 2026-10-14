@@ -104,4 +104,6 @@ def _default_embed(texts: list[str]) -> list[list[float]]:
 
 def get_memory_store() -> MemoryStore:
     cfg = get_app_config()
-    return MemoryStore(_default_embed, enabled=cfg.memory.enabled and bool(get_settings().dashscope_api_key))
+    return MemoryStore(
+        _default_embed, enabled=cfg.memory.enabled and bool(get_settings().dashscope_api_key)
+    )

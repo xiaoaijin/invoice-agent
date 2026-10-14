@@ -29,6 +29,12 @@ class AgentState(TypedDict, total=False):
     # RAG
     rag_chunks: list[RetrievedChunk]
 
+    # 自反馈（回答自评回环 / 风控复核）
+    critique: dict | None  # CritiqueResult.model_dump()（回答自评结果）
+    answer_retry: int  # 答案重生成计数（上限 feedback.answer.max_retries）
+    critic_feedback: str | None  # 自评不通过时传给 finalize 的改进提示
+    risk_review: dict | None  # RiskReview.model_dump()（风控复核：removed/added/summary）
+
     # 输出
     answer: str | None  # 最终回答（Markdown）
 

@@ -27,8 +27,11 @@ def _tokenize(text: str) -> list[str]:
     return [t for t in jieba.cut_for_search(text) if t.strip()]
 
 
-def rrf_fuse(vec_hits: list[RetrievedChunk], bm25_hits: list[RetrievedChunk], top_k: int) -> list[RetrievedChunk]:
+def rrf_fuse(
+    vec_hits: list[RetrievedChunk], bm25_hits: list[RetrievedChunk], top_k: int
+) -> list[RetrievedChunk]:
     """RRF 融合两路检索结果（纯函数，key 为 source+article_no+text 前缀）。"""
+
     def key(c: RetrievedChunk) -> tuple:
         return (c.source, c.article_no, c.text)
 
@@ -63,7 +66,9 @@ class HybridRetriever:
         ).fetchall()
         if not rows:
             self._conn.close()
-            raise RuntimeError("知识库为空，请先运行：uv run python scripts/build_knowledge_index.py")
+            raise RuntimeError(
+                "知识库为空，请先运行：uv run python scripts/build_knowledge_index.py"
+            )
         self._chunks = [
             {"id": r[0], "source": r[1], "doc_title": r[2], "article_no": r[3], "text": r[4]}
             for r in rows
@@ -79,13 +84,19 @@ class HybridRetriever:
             (to_vector_literal(vec), to_vector_literal(vec), top_k),
         ).fetchall()
         return [
-            RetrievedChunk(source=r[0], doc_title=r[1], article_no=r[2] or None, text=r[3], score=float(r[4]))
+            RetrievedChunk(
+                source=r[0], doc_title=r[1], article_no=r[2] or None, text=r[3], score=float(r[4])
+            )
             for r in rows
         ]
 
     def _bm25_search(self, query: str, top_k: int) -> list[RetrievedChunk]:
         scores = self._bm25.get_scores(_tokenize(query))
-        ranked = [i for i in sorted(range(len(scores)), key=lambda i: scores[i], reverse=True) if scores[i] > 0]
+        ranked = [
+            i
+            for i in sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+            if scores[i] > 0
+        ]
         return [
             RetrievedChunk(
                 source=self._chunks[i]["source"],

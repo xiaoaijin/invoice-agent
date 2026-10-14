@@ -17,11 +17,26 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from invoice_agent.config import get_app_config
+from invoice_agent.monitoring.setup import setup_logging
 from invoice_agent.services.dedup_store import DedupStore
+
+setup_logging()
 
 st.set_page_config(page_title="发票助手 Agent", page_icon="🧾", layout="wide")
 
 MAX_DISPLAY_HISTORY = 50
+
+NODE_LABELS = {
+    "intake": "接收文件",
+    "recognize": "识票提取",
+    "verify": "验真",
+    "dedup": "去重检查",
+    "risk": "风控规则",
+    "risk_review": "风控复核",
+    "retrieve_docs": "政策检索",
+    "finalize": "汇总回答",
+    "critic_answer": "回答自评",
+}
 
 
 def ensure_session() -> str:
@@ -31,14 +46,47 @@ def ensure_session() -> str:
     return st.session_state.thread_id
 
 
-def run_graph(file_path: str | None, question: str | None, thread_id: str) -> dict:
+def run_graph(
+    file_path: str | None,
+    question: str | None,
+    thread_id: str,
+    progress_cb=None,
+) -> tuple[dict, object | None]:
+    """流式执行图：每完成一个节点回调 progress_cb，返回聚合的最终 state 与监控 handler。"""
     from invoice_agent.graph.builder import build_graph
+    from invoice_agent.monitoring.setup import build_run_config
 
+    config, handler = build_run_config(thread_id, run_type="invoice" if file_path else "ask")
     graph = build_graph()
-    return graph.invoke(
+    final: dict = {}
+    for update in graph.stream(
         {"session_id": thread_id, "file_path": file_path, "user_question": question},
-        config={"configurable": {"thread_id": thread_id}},
-    )
+        config=config,
+        stream_mode="updates",
+    ):
+        for node, delta in update.items():
+            final.update(delta or {})
+            if progress_cb:
+                progress_cb(node, handler)
+    return final, handler
+
+
+def _node_latency(handler, node: str) -> float | None:
+    """从 handler 事件缓冲中取节点最近一次耗时（ms）。"""
+    if handler is None:
+        return None
+    for e in reversed(handler.events):
+        if e.get("type") == "node_end" and e.get("node") == node:
+            return e.get("latency_ms")
+    return None
+
+
+def _progress_writer(node: str, handler) -> None:
+    """run_graph 的实时进度回调：在 st.status 容器内逐行打勾。"""
+    label = NODE_LABELS.get(node, node)
+    latency = _node_latency(handler, node)
+    line = f"✅ {label}" if latency is None else f"✅ {label}（{latency:.0f}ms）"
+    st.write(line)
 
 
 def render_invoice_card(invoice) -> None:
@@ -48,7 +96,9 @@ def render_invoice_card(invoice) -> None:
     c1.metric("发票号码", invoice.invoice_number)
     c2.metric("开票日期", str(invoice.invoice_date))
     c2.metric("价税合计", f"¥{invoice.total_amount:,.2f}")
-    c3.metric("不含税金额", f"¥{invoice.amount_without_tax:,.2f}" if invoice.amount_without_tax else "—")
+    c3.metric(
+        "不含税金额", f"¥{invoice.amount_without_tax:,.2f}" if invoice.amount_without_tax else "—"
+    )
     c3.metric("税额", f"¥{invoice.tax_amount:,.2f}" if invoice.tax_amount else "—")
     st.write(f"**购买方**：{invoice.buyer_name}（税号 {invoice.buyer_tax_id or '—'}）")
     st.write(f"**销售方**：{invoice.seller_name}（税号 {invoice.seller_tax_id or '—'}）")
@@ -90,13 +140,15 @@ def render_chat_tab() -> None:
         with st.chat_message("user" if entry["role"] == "user" else "assistant"):
             st.markdown(entry["content"])
 
-    if question := st.chat_input("输入问题（支持追问，如\"那出租车票呢？\"）"):
+    if question := st.chat_input('输入问题（支持追问，如"那出租车票呢？"）'):
         display.append({"role": "user", "content": question})
         with st.chat_message("user"):
             st.markdown(question)
         with st.chat_message("assistant"):
-            with st.spinner("思考中…"):
-                state = run_graph(None, question, thread_id)
+            with st.status("思考中…", expanded=False) as status:
+                state, handler = run_graph(None, question, thread_id, progress_cb=_progress_writer)
+                done = sum(1 for e in handler.events if e["type"] == "node_end") if handler else 0
+                status.update(label=f"✅ 完成（{done} 个节点）", state="complete")
             answer = state.get("answer") or "（无回答）"
             st.markdown(answer)
             if state.get("rag_chunks"):
@@ -108,13 +160,97 @@ def render_chat_tab() -> None:
         display.append({"role": "assistant", "content": answer})
 
 
+def render_monitor_tab() -> None:
+    """监控面板：近况指标、历史 run 明细、告警高亮（只读自 MonitorStore）。"""
+    from invoice_agent.monitoring.store import MonitorStore
+
+    cfg = get_app_config()
+    if not cfg.monitoring.enabled:
+        st.info("监控未启用（config.yaml: monitoring.enabled=false）")
+        return
+    store = MonitorStore(cfg.monitoring_db_path)
+    window = cfg.monitoring.alert.success_rate_window
+    stats = store.stats(window)
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric(f"近 {window} 次 run", stats["run_count"])
+    c2.metric(
+        "成功率",
+        f"{stats['success_rate']:.0%}" if stats["success_rate"] is not None else "—",
+        delta="低于阈值"
+        if stats["success_rate"] is not None
+        and stats["success_rate"] < cfg.monitoring.alert.min_success_rate
+        else None,
+    )
+    c3.metric(
+        "平均耗时", f"{stats['avg_latency_ms'] / 1000:.1f}s" if stats["avg_latency_ms"] else "—"
+    )
+    c4.metric("Token 用量", f"{stats['prompt_tokens'] + stats['completion_tokens']:,}")
+    c5.metric("累计成本", f"¥{stats['cost_yuan']:.4f}")
+
+    st.subheader("🔔 告警")
+    alerts = store.recent_alerts(30)
+    if not alerts:
+        st.success("无告警")
+    for a in alerts:
+        detail = f"{a['created_at'][:19]} ｜ {a['detail']}"
+        if a["severity"] == "ERROR":
+            st.error(f"🔴 [{a['alert_type']}] {detail}", icon="🚨")
+        else:
+            st.warning(f"🟡 [{a['alert_type']}] {detail}")
+
+    st.subheader("🕘 最近运行")
+    runs = store.recent_runs(20)
+    if not runs:
+        st.caption("暂无运行记录")
+        return
+    st.dataframe(
+        [
+            {
+                "时间": r["started_at"][:19] if r["started_at"] else "",
+                "类型": r["run_type"] or "",
+                "状态": r["status"] or "",
+                "耗时(s)": round((r["total_latency_ms"] or 0) / 1000, 1),
+                "重试": r["retry_count"] or 0,
+                "节点数": r["node_count"] or 0,
+                "tokens": (r["prompt_tokens"] or 0) + (r["completion_tokens"] or 0),
+                "成本(元)": round(r["cost_yuan"] or 0, 4),
+            }
+            for r in runs
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+    options = [r["run_id"] for r in runs]
+    picked = st.selectbox("查看节点时间线", options, format_func=lambda rid: f"run {rid[:8]}…")
+    detail = store.run_detail(picked)
+    if detail["spans"]:
+        st.dataframe(
+            [
+                {
+                    "节点": NODE_LABELS.get(s["node"], s["node"]),
+                    "顺序": s["seq"],
+                    "耗时(ms)": round(s["latency_ms"] or 0),
+                    "状态": s["status"],
+                    "重试次数": s["retry_of"],
+                    "错误": s["error"] or "",
+                }
+                for s in detail["spans"]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
 def main() -> None:
     st.title("🧾 发票助手 Agent")
     st.caption("识票 · 验真 · 风控 · 政策问答 · 多轮对话（验真当前为 Mock，未接真实查验平台）")
 
     cfg = get_app_config()
     thread_id = ensure_session()
-    tab_invoice, tab_ask = st.tabs(["📤 发票查验", "💬 政策问答（多轮对话）"])
+    tab_invoice, tab_ask, tab_monitor = st.tabs(
+        ["📤 发票查验", "💬 政策问答（多轮对话）", "📈 监控面板"]
+    )
 
     with tab_invoice:
         uploaded = st.file_uploader("上传发票（图片或 PDF）", type=["png", "jpg", "jpeg", "pdf"])
@@ -129,8 +265,14 @@ def main() -> None:
                 tmp.mkdir(parents=True, exist_ok=True)
                 fpath = tmp / uploaded.name
                 fpath.write_bytes(uploaded.getvalue())
-                with st.spinner("识别与校验中…"):
-                    state = run_graph(str(fpath), question or None, thread_id)
+                with st.status("识别与校验中…", expanded=False) as status:
+                    state, handler = run_graph(
+                        str(fpath), question or None, thread_id, progress_cb=_progress_writer
+                    )
+                    done = (
+                        sum(1 for e in handler.events if e["type"] == "node_end") if handler else 0
+                    )
+                    status.update(label=f"✅ 校验完成（{done} 个节点）", state="complete")
                 st.session_state["last_state"] = {
                     "invoice": state.get("invoice"),
                     "verification": state.get("verification"),
@@ -138,7 +280,9 @@ def main() -> None:
                     "findings": state.get("risk_findings") or [],
                     "answer": state.get("answer"),
                     "file_path": str(fpath),
-                    "invoice_dump": state.get("invoice").model_dump(mode="json") if state.get("invoice") else None,
+                    "invoice_dump": state.get("invoice").model_dump(mode="json")
+                    if state.get("invoice")
+                    else None,
                 }
 
         state = st.session_state.get("last_state")
@@ -192,6 +336,9 @@ def main() -> None:
 
     with tab_ask:
         render_chat_tab()
+
+    with tab_monitor:
+        render_monitor_tab()
 
 
 main()

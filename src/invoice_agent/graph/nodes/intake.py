@@ -42,4 +42,7 @@ def intake(state: AgentState) -> dict:
     img = Image.open(p)
     buf = io.BytesIO()
     img.save(buf, format="PNG")
-    return {"file_type": suffix.lstrip("."), "page_images": [_to_data_url(buf.getvalue(), "image/png")]}
+    return {
+        "file_type": suffix.lstrip("."),
+        "page_images": [_to_data_url(buf.getvalue(), "image/png")],
+    }

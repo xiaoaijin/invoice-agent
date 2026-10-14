@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from invoice_agent.config import get_app_config
+from invoice_agent.feedback.critics import default_llm_fn, field_self_check
 from invoice_agent.graph.state import AgentState
 from invoice_agent.models.invoice import InvoiceData
 from invoice_agent.services.llm import get_vision_model
@@ -61,6 +63,13 @@ def recognize(state: AgentState) -> dict:
         }
 
     errors = check_extract(invoice)
+    # 自反馈：代码级校验通过后再做 LLM 级字段自检（缺失/逻辑矛盾），
+    # 产出更精准的重试提示，复用既有 extract_error 重试边（有界 retry<2）。
+    if not errors and get_app_config().feedback.field_check.enabled:
+        try:
+            errors = field_self_check(invoice, default_llm_fn())
+        except Exception:  # noqa: BLE001 — 自检是增强项，失败不阻塞
+            errors = []
     if errors:
         return {
             "invoice": None,

@@ -11,6 +11,7 @@ dist/
 
 # 运行时数据
 data/
+logs/
 
 # 真实发票样本严禁入库；合成样本可按需保留
 samples/*.png

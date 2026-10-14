@@ -29,6 +29,19 @@ def make_invoice(**kw) -> InvoiceData:
     return InvoiceData(**base)
 
 
+@pytest.fixture(autouse=True)
+def _skip_critics(monkeypatch):
+    """自反馈节点会调 LLM，e2e 流转测试统一短路（critic 自身逻辑见 test_critics.py）。"""
+    from invoice_agent.graph.nodes import critic
+
+    monkeypatch.setattr(
+        critic,
+        "critic_answer",
+        lambda state: {"critique": {"passed": True}, "critic_feedback": None},
+    )
+    monkeypatch.setattr(critic, "risk_review", lambda state: {})
+
+
 def _patch_config(monkeypatch, tmp_path: Path) -> None:
     """把各节点引用的 get_app_config 指向临时 SQLite 路径（真实 AppConfig 结构）。"""
     from invoice_agent.config import AppConfig, CompanyConfig, PathsConfig, RiskConfig
@@ -54,11 +67,14 @@ def graph(tmp_path: Path, monkeypatch):
     from invoice_agent.graph import nodes
 
     # 1. intake 不真实读文件（省去生成图片），直接注入 page_images
-    monkeypatch.setattr(nodes.intake, "intake", lambda state: {"page_images": ["data:image/png;base64,xx"]})
+    monkeypatch.setattr(
+        nodes.intake, "intake", lambda state: {"page_images": ["data:image/png;base64,xx"]}
+    )
 
     # 2. recognize 返回固定发票
     monkeypatch.setattr(
-        nodes.recognize, "recognize",
+        nodes.recognize,
+        "recognize",
         lambda state: {"invoice": make_invoice(), "extract_error": None, "recognize_retry": 0},
     )
 
@@ -70,7 +86,8 @@ def graph(tmp_path: Path, monkeypatch):
 
     # 5. finalize 不调 LLM，输出确定性文本
     monkeypatch.setattr(
-        nodes.answer, "finalize",
+        nodes.answer,
+        "finalize",
         lambda state: {"answer": f"OK invoice={state['invoice'].invoice_number}"},
     )
 
@@ -114,7 +131,8 @@ class TestGraphFlow:
 
         monkeypatch.setattr(answer_mod, "retrieve_docs", lambda state: {"rag_chunks": []})
         monkeypatch.setattr(
-            nodes.answer, "finalize",
+            nodes.answer,
+            "finalize",
             lambda state: {"answer": f"retries={state.get('recognize_retry', 0)}"},
         )
 
@@ -154,7 +172,8 @@ class TestGraphFlow:
 
         monkeypatch.setattr(answer_mod, "retrieve_docs", lambda state: {"rag_chunks": []})
         monkeypatch.setattr(
-            nodes.answer, "finalize",
+            nodes.answer,
+            "finalize",
             lambda state: {"answer": "RAG-ONLY"},
         )
         g = _fresh_graph()

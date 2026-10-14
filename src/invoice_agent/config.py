@@ -51,6 +51,51 @@ class ContextConfig(BaseModel):
     keep_recent_rounds: int = 10  # 压缩时原样保留的最近轮数（更早的进摘要）
 
 
+class AlertConfig(BaseModel):
+    """监控告警阈值。"""
+
+    node_latency_budget_ms: dict[str, int] = Field(
+        default_factory=lambda: {"default": 10000}
+    )  # 节点延迟预算（按节点名查表，缺省用 default）
+    run_latency_budget_ms: int = 60000
+    max_retries_per_run: int = 2  # 单次 run 内同节点重复执行超此数告警
+    success_rate_window: int = 20  # 近 N 次 run 的成功率窗口
+    min_success_rate: float = 0.9
+
+
+class MonitoringConfig(BaseModel):
+    """全流程监控配置。"""
+
+    enabled: bool = True
+    db: str = "data/monitor.db"
+    log_level: str = "INFO"
+    log_file: str = "logs/agent.log"
+    pricing: dict[str, dict[str, float]] = Field(default_factory=dict)  # 每千 token 成本（元）
+    alert: AlertConfig = Field(default_factory=AlertConfig)
+
+
+class AnswerFeedbackConfig(BaseModel):
+    enabled: bool = True
+    max_retries: int = 1  # 不合格时最多重生成次数
+    pass_score: float = 0.7
+
+
+class FieldCheckConfig(BaseModel):
+    enabled: bool = True
+
+
+class RiskReviewConfig(BaseModel):
+    enabled: bool = True
+
+
+class FeedbackConfig(BaseModel):
+    """自反馈优化配置（各环路独立开关，LLM 失败自动降级）。"""
+
+    answer: AnswerFeedbackConfig = Field(default_factory=AnswerFeedbackConfig)
+    field_check: FieldCheckConfig = Field(default_factory=FieldCheckConfig)
+    risk_review: RiskReviewConfig = Field(default_factory=RiskReviewConfig)
+
+
 class MemoryConfig(BaseModel):
     """pgvector 长期记忆召回参数。"""
 
@@ -73,6 +118,8 @@ class AppConfig(BaseModel):
     risk: RiskConfig
     context: ContextConfig = ContextConfig()
     memory: MemoryConfig = MemoryConfig()
+    monitoring: MonitoringConfig = MonitoringConfig()
+    feedback: FeedbackConfig = FeedbackConfig()
     paths: PathsConfig
 
     def resolve(self, rel: str) -> Path:
@@ -83,6 +130,10 @@ class AppConfig(BaseModel):
     @property
     def db_path(self) -> Path:
         return self.resolve(self.paths.db)
+
+    @property
+    def monitoring_db_path(self) -> Path:
+        return self.resolve(self.monitoring.db)
 
     @property
     def knowledge_dir(self) -> Path:
@@ -112,7 +163,5 @@ def require_api_key() -> str:
     """需要真实调用 LLM 时使用；缺失则 fail-fast 并给出可操作的提示。"""
     key = get_settings().dashscope_api_key
     if not key or key.startswith("sk-xxxx"):
-        raise RuntimeError(
-            "DASHSCOPE_API_KEY 未配置。请复制 .env.example 为 .env 并填入真实 key。"
-        )
+        raise RuntimeError("DASHSCOPE_API_KEY 未配置。请复制 .env.example 为 .env 并填入真实 key。")
     return key
