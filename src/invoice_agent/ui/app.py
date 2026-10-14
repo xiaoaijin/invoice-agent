@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import sys
+import uuid
 from datetime import date
 from pathlib import Path
 
@@ -20,14 +21,23 @@ from invoice_agent.services.dedup_store import DedupStore
 
 st.set_page_config(page_title="发票助手 Agent", page_icon="🧾", layout="wide")
 
+MAX_DISPLAY_HISTORY = 50
 
-def run_graph(file_path: str | None, question: str | None) -> dict:
+
+def ensure_session() -> str:
+    """会话 thread_id：同一浏览器会话共享（含发票查验与追问），「新对话」重置。"""
+    if "thread_id" not in st.session_state:
+        st.session_state.thread_id = uuid.uuid4().hex
+    return st.session_state.thread_id
+
+
+def run_graph(file_path: str | None, question: str | None, thread_id: str) -> dict:
     from invoice_agent.graph.builder import build_graph
 
     graph = build_graph()
     return graph.invoke(
-        {"session_id": "streamlit", "file_path": file_path, "user_question": question},
-        config={"configurable": {"thread_id": "streamlit"}},
+        {"session_id": thread_id, "file_path": file_path, "user_question": question},
+        config={"configurable": {"thread_id": thread_id}},
     )
 
 
@@ -62,12 +72,49 @@ def render_invoice_card(invoice) -> None:
         st.warning(f"以下字段置信度较低，请人工核对：{low_conf}")
 
 
+def render_chat_tab() -> None:
+    """多轮对话：历史来自 state（checkpointer 持久化），发票查验后可在对话中追问。"""
+    col1, _ = st.columns([1, 4])
+    with col1:
+        new_chat = st.button("🆕 新对话", help="重置对话记忆与上下文")
+    if new_chat:
+        st.session_state.thread_id = uuid.uuid4().hex
+        st.session_state.chat_display = []
+        st.rerun()
+
+    thread_id = st.session_state.thread_id
+    display: list[dict] = st.session_state.setdefault("chat_display", [])
+
+    # 渲染历史气泡
+    for entry in display[-MAX_DISPLAY_HISTORY:]:
+        with st.chat_message("user" if entry["role"] == "user" else "assistant"):
+            st.markdown(entry["content"])
+
+    if question := st.chat_input("输入问题（支持追问，如\"那出租车票呢？\"）"):
+        display.append({"role": "user", "content": question})
+        with st.chat_message("user"):
+            st.markdown(question)
+        with st.chat_message("assistant"):
+            with st.spinner("思考中…"):
+                state = run_graph(None, question, thread_id)
+            answer = state.get("answer") or "（无回答）"
+            st.markdown(answer)
+            if state.get("rag_chunks"):
+                with st.expander("查看检索到的条款"):
+                    for c in state["rag_chunks"]:
+                        article = c.article_no or ""
+                        st.markdown(f"**《{c.source}》{c.doc_title} {article}**（score={c.score}）")
+                        st.text(c.text[:300])
+        display.append({"role": "assistant", "content": answer})
+
+
 def main() -> None:
     st.title("🧾 发票助手 Agent")
-    st.caption("识票 · 验真 · 风控 · 政策问答（验真当前为 Mock，未接真实查验平台）")
+    st.caption("识票 · 验真 · 风控 · 政策问答 · 多轮对话（验真当前为 Mock，未接真实查验平台）")
 
     cfg = get_app_config()
-    tab_invoice, tab_ask = st.tabs(["📤 发票查验", "💬 政策问答"])
+    thread_id = ensure_session()
+    tab_invoice, tab_ask = st.tabs(["📤 发票查验", "💬 政策问答（多轮对话）"])
 
     with tab_invoice:
         uploaded = st.file_uploader("上传发票（图片或 PDF）", type=["png", "jpg", "jpeg", "pdf"])
@@ -83,7 +130,7 @@ def main() -> None:
                 fpath = tmp / uploaded.name
                 fpath.write_bytes(uploaded.getvalue())
                 with st.spinner("识别与校验中…"):
-                    state = run_graph(str(fpath), question or None)
+                    state = run_graph(str(fpath), question or None, thread_id)
                 st.session_state["last_state"] = {
                     "invoice": state.get("invoice"),
                     "verification": state.get("verification"),
@@ -144,17 +191,7 @@ def main() -> None:
                     st.success("已写入报销台账，重复报销检测即刻生效")
 
     with tab_ask:
-        q = st.text_area("输入政策问题", placeholder="例如：差旅补贴标准是多少？购物卡发票能不能报销？")
-        if st.button("提问", type="primary", disabled=not q.strip()) and q.strip():
-            with st.spinner("检索政策条款并生成回答…"):
-                state = run_graph(None, q.strip())
-            st.markdown(state.get("answer") or "（无回答）")
-            if state.get("rag_chunks"):
-                with st.expander("查看检索到的条款"):
-                    for c in state["rag_chunks"]:
-                        article = c.article_no or ""
-                        st.markdown(f"**《{c.source}》{c.doc_title} {article}**（score={c.score}）")
-                        st.text(c.text[:300])
+        render_chat_tab()
 
 
 main()

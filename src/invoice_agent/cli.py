@@ -65,6 +65,37 @@ def cmd_ask(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_chat(args: argparse.Namespace) -> int:
+    """多轮对话 REPL：/invoice <文件> 查验发票，/new 重置会话，/quit 退出。"""
+    from invoice_agent.graph.builder import build_graph
+
+    graph = build_graph()
+    thread_id = f"cli-chat-{args.session}"
+    print(f"多轮对话模式（会话 {args.session}）。/invoice <文件> 查验发票；/new 新会话；/quit 退出。")
+    while True:
+        try:
+            question = input("\n你> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if not question:
+            continue
+        if question == "/quit":
+            return 0
+        if question == "/new":
+            thread_id = f"cli-chat-{args.session}-{int(__import__('time').time())}"
+            print(f"（已切换新会话：{thread_id}）")
+            continue
+        file_path = None
+        if question.startswith("/invoice "):
+            file_path, question = question[len("/invoice "):].strip(), "这张发票能否报销？有什么风险？"
+        state = graph.invoke(
+            {"session_id": thread_id, "file_path": file_path, "user_question": question},
+            config={"configurable": {"thread_id": thread_id}},
+        )
+        print(f"\n助手> {state.get('answer') or '(无输出)'}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="invoice-agent", description="发票助手 Agent")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -81,6 +112,10 @@ def main(argv: list[str] | None = None) -> int:
     p_ask = sub.add_parser("ask", help="纯政策问答（RAG）")
     p_ask.add_argument("question")
     p_ask.set_defaults(func=cmd_ask)
+
+    p_chat = sub.add_parser("chat", help="多轮对话模式（支持追问与发票查验）")
+    p_chat.add_argument("--session", default="default", help="会话名（同一会话保留记忆）")
+    p_chat.set_defaults(func=cmd_chat)
 
     args = parser.parse_args(argv)
     return args.func(args)

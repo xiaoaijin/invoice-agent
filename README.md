@@ -10,7 +10,8 @@
 | 合规查验 | 验真（Mock Provider，接口抽象可切换百望云/诺诺）、抬头税号校验、重复报销检测（SQLite 台账） |
 | 政策问答 | RAG 混合检索（Chroma 向量 + BM25/jieba，RRF 融合），回答强制引用条款编号，检索不足时明确拒答 |
 | 异常预警 | 8 条规则：抬头不符 / 重复 / 连号 / 大额拆分 / 敏感商品 / 报销时效 / 日期异常 / 金额勾稽 |
-| 界面 | Streamlit：上传查验 + 确认报销入台账 + 政策问答聊天 |
+| 多轮对话 | checkpointer（MemorySaver）按 thread_id 持久化会话；支持追问（检索 query 自动拼上上一问题）；发票查验后可在对话中继续追问 |
+| 界面 | Streamlit：上传查验 + 确认报销入台账 + 多轮对话聊天（可一键新会话） |
 
 ## 快速开始
 
@@ -43,6 +44,7 @@ CLI 调试：
 uv run python -m invoice_agent.cli recognize samples/01_normal_special.png  # 只识票，输出 JSON
 uv run python -m invoice_agent.cli run samples/04_wrong_taxid.png           # 完整链路
 uv run python -m invoice_agent.cli ask "餐饮发票能抵扣进项税吗"               # 纯政策问答
+uv run python -m invoice_agent.cli chat                                      # 多轮对话 REPL（/invoice <文件> 查票，/new 新会话）
 ```
 
 ## 演示路径（用合成样本）
@@ -81,6 +83,7 @@ START → intake → [route_entry] ─┬→ recognize ⇄（失败重试 ≤2�
 - **验真**：`InvoiceVerifyProvider` 抽象 + Mock 实现（注册表命中 → 确定性结果；未命中 → 哈希伪随机 85% PASS）。接入百望云/诺诺时新增 Provider 实现即可，图节点零改动
 - **去重**：SQLite 台账，"确认提交报销"后才写入，避免查询污染连号/拆分判断；`file_sha256` 区分同文件重传
 - **RAG**：按「第X条」切分保引用完整 → DashScope text-embedding-v3 + Chroma → jieba+BM25 → RRF 融合 → 引用编号来自切分元数据（非模型生成）
+- **多轮记忆**：`MemorySaver` checkpointer 按 thread_id 持久化整个 AgentState（含 `chat_history`）；finalize 把最近 8 条历史转为消息注入 LLM；短问题/「那/为什么」开头的追问在检索时自动拼上上一问题补全语义
 - **配置**：密钥在 `.env`（不入库），业务阈值/敏感词在 `config.yaml`
 
 ## 已知限制与注意事项
@@ -97,4 +100,4 @@ START → intake → [route_entry] ─┬→ recognize ⇄（失败重试 ≤2�
 - FastAPI 服务层（供 ERP/Java 系统调用）
 - 验真接入百望云/诺诺真实 API
 - 企业微信/钉钉/飞书机器人接入、批量异步处理
-- 多轮对话记忆（checkpointer 已预留 MemorySaver）
+- 跨进程持久化记忆（当前 MemorySaver 为进程内，重启即失；生产可换 SqliteSaver/PostgresSaver）
