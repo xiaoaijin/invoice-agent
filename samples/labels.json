@@ -1,0 +1,146 @@
+[
+  {
+    "sample_id": "01_normal_special",
+    "invoice_type": "浙江增值税专用发票",
+    "invoice_code": "044032000111",
+    "invoice_number": "28374651",
+    "invoice_date": "2026年09月30日",
+    "buyer_name": "示例科技有限公司",
+    "buyer_tax_id": "91330100MA27XXXXXX",
+    "seller_name": "杭州某某商贸有限公司",
+    "seller_tax_id": "91330100MA28YYYYYY",
+    "amount_without_tax": 1000.0,
+    "tax_amount": 130.0,
+    "total_amount": 1130.0,
+    "items": [
+      "办公用纸A4"
+    ],
+    "blurred": false
+  },
+  {
+    "sample_id": "02_normal_personal",
+    "invoice_type": "浙江增值税普通发票",
+    "invoice_code": "044032000112",
+    "invoice_number": "31928374",
+    "invoice_date": "2026年10月08日",
+    "buyer_name": "个人",
+    "buyer_tax_id": null,
+    "seller_name": "杭州某某餐饮管理有限公司",
+    "seller_tax_id": "91330100MA29ZZZZZZ",
+    "amount_without_tax": 380.0,
+    "tax_amount": 0.0,
+    "total_amount": 380.0,
+    "items": [
+      "餐饮服务*餐费"
+    ],
+    "blurred": false
+  },
+  {
+    "sample_id": "03_digital",
+    "invoice_type": "电子发票（增值税专用发票）",
+    "invoice_code": null,
+    "invoice_number": "25612000000123456789",
+    "invoice_date": "2026年10月10日",
+    "buyer_name": "示例科技有限公司",
+    "buyer_tax_id": "91330100MA27XXXXXX",
+    "seller_name": "杭州某某商贸有限公司",
+    "seller_tax_id": "91330100MA28YYYYYY",
+    "amount_without_tax": 2000.0,
+    "tax_amount": 260.0,
+    "total_amount": 2260.0,
+    "items": [
+      "打印耗材硒鼓"
+    ],
+    "blurred": false
+  },
+  {
+    "sample_id": "04_wrong_taxid",
+    "invoice_type": "浙江增值税专用发票",
+    "invoice_code": "044032000113",
+    "invoice_number": "41526374",
+    "invoice_date": "2026年10月11日",
+    "buyer_name": "示例科技有限公司",
+    "buyer_tax_id": "91330100MA00WRONGX",
+    "seller_name": "杭州某某商贸有限公司",
+    "seller_tax_id": "91330100MA28YYYYYY",
+    "amount_without_tax": 800.0,
+    "tax_amount": 104.0,
+    "total_amount": 904.0,
+    "items": [
+      "电脑配件"
+    ],
+    "blurred": false
+  },
+  {
+    "sample_id": "05_sensitive_giftcard",
+    "invoice_type": "浙江增值税普通发票",
+    "invoice_code": "044032000114",
+    "invoice_number": "52637485",
+    "invoice_date": "2026年10月12日",
+    "buyer_name": "示例科技有限公司",
+    "buyer_tax_id": "91330100MA27XXXXXX",
+    "seller_name": "杭州某某百货有限公司",
+    "seller_tax_id": "91330100MA30AAAAAA",
+    "amount_without_tax": 3000.0,
+    "tax_amount": 0.0,
+    "total_amount": 3000.0,
+    "items": [
+      "购物卡"
+    ],
+    "blurred": false
+  },
+  {
+    "sample_id": "06_serial_with_01",
+    "invoice_type": "浙江增值税专用发票",
+    "invoice_code": "044032000111",
+    "invoice_number": "28374655",
+    "invoice_date": "2026年09月30日",
+    "buyer_name": "示例科技有限公司",
+    "buyer_tax_id": "91330100MA27XXXXXX",
+    "seller_name": "杭州某某商贸有限公司",
+    "seller_tax_id": "91330100MA28YYYYYY",
+    "amount_without_tax": 500.0,
+    "tax_amount": 65.0,
+    "total_amount": 565.0,
+    "items": [
+      "签字笔"
+    ],
+    "blurred": false
+  },
+  {
+    "sample_id": "07_fake_invoice",
+    "invoice_type": "浙江增值税专用发票",
+    "invoice_code": "044032000999",
+    "invoice_number": "99999999",
+    "invoice_date": "2026年10月13日",
+    "buyer_name": "示例科技有限公司",
+    "buyer_tax_id": "91330100MA27XXXXXX",
+    "seller_name": "杭州某某商贸有限公司",
+    "seller_tax_id": "91330100MA28YYYYYY",
+    "amount_without_tax": 5000.0,
+    "tax_amount": 650.0,
+    "total_amount": 5650.0,
+    "items": [
+      "咨询服务费"
+    ],
+    "blurred": false
+  },
+  {
+    "sample_id": "08_blurred",
+    "invoice_type": "浙江增值税普通发票",
+    "invoice_code": "044032000115",
+    "invoice_number": "63748596",
+    "invoice_date": "2026年09月15日",
+    "buyer_name": "示例科技有限公司",
+    "buyer_tax_id": "91330100MA27XXXXXX",
+    "seller_name": "杭州某某出租车有限公司",
+    "seller_tax_id": "91330100MA31BBBBBB",
+    "amount_without_tax": 200.0,
+    "tax_amount": 0.0,
+    "total_amount": 200.0,
+    "items": [
+      "客运服务费"
+    ],
+    "blurred": true
+  }
+]

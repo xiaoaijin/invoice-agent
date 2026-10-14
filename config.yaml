@@ -1,0 +1,25 @@
+# 业务配置（非密钥）。公司抬头/税号、风控阈值、敏感词表等
+company:
+  name: "示例科技有限公司"
+  tax_id: "91330100MA27XXXXXX"
+
+risk:
+  serial_gap_tolerance: 5        # 连号判定：同销售方发票号差值 ≤ N 视为连号
+  split_amount_threshold: 5000   # 大额拆分：累计金额阈值（元）
+  split_window_days: 7           # 拆分判定时间窗口（天）
+  split_min_count: 3             # 拆分判定最少张数
+  reimburse_deadline_days: 90    # 报销时效（天）
+  confidence_threshold: 0.8      # 低于此置信度提示人工复核
+  sensitive_keywords:
+    - "礼品卡"
+    - "购物卡"
+    - "储值卡"
+    - "预付卡"
+    - "烟"
+    - "酒"
+    - "高档"
+
+paths:
+  db: "data/invoice_agent.db"
+  chroma_dir: "data/chroma"
+  knowledge_dir: "knowledge"

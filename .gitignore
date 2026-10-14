@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+
+# 密钥与环境
+.env
+
+# 运行时数据
+data/
+
+# 真实发票样本严禁入库；合成样本可按需保留
+samples/*.png
+samples/*.pdf
+!samples/labels.json
