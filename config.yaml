@@ -39,6 +39,7 @@ monitoring:
   log_file: "logs/agent.log"  # 结构化日志（RotatingFileHandler 5MB×3）
   pricing:                    # 每千 token 成本（元），未配置的模型不计成本
     qwen3.5-omni-plus: { input: 0.007, output: 0.04 }  # 文本/图片输入 7 元/M，文本输出 40 元/M（无音频路径）
+    qwen3.7-text-embedding: { input: 0.0005, output: 0.0 }  # 文本输入 0.5 元/M（Batch File 0.25 元/M 未单独计价）
   alert:
     node_latency_budget_ms:   # 节点延迟预算（毫秒），未列出的用 default
       default: 10000
