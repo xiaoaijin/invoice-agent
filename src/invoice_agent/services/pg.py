@@ -19,10 +19,11 @@ EMBEDDING_DIM = 1024  # DashScope text-embedding-v3
 SCHEMA = f"""
 CREATE EXTENSION IF NOT EXISTS vector;
 
--- 知识库 RAG（原 Chroma 迁移至此）
+-- 知识库 RAG（原 Chroma 迁移至此）。layer：三层知识库层级（national/local/company）
 CREATE TABLE IF NOT EXISTS knowledge_chunks (
     id TEXT PRIMARY KEY,
     source TEXT NOT NULL,
+    layer TEXT NOT NULL DEFAULT '',
     doc_title TEXT NOT NULL DEFAULT '',
     article_no TEXT NOT NULL DEFAULT '',
     content TEXT NOT NULL,
@@ -30,6 +31,8 @@ CREATE TABLE IF NOT EXISTS knowledge_chunks (
 );
 CREATE INDEX IF NOT EXISTS idx_knowledge_hnsw
     ON knowledge_chunks USING hnsw (embedding vector_cosine_ops);
+-- 旧表迁移：补 layer 列
+ALTER TABLE knowledge_chunks ADD COLUMN IF NOT EXISTS layer TEXT NOT NULL DEFAULT '';
 
 -- 长期对话记忆：每轮问答存一行（Q+A 合并向量），语义召回用
 CREATE TABLE IF NOT EXISTS memory_chunks (

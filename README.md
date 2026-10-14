@@ -103,7 +103,7 @@ START → intake → [route_entry] ─┬→ recognize ⇄（失败重试 ≤2�
 ## 已知限制与注意事项
 
 1. **验真为 Mock**：结果显式标注，不代表真实真伪。接入真实平台需企业资质与付费开通。
-2. **知识库为合成语料**（`knowledge/` 下为节选/示例文档，部分条款已过时如旅客运输抵扣政策），生产使用前需替换为最新法规全文与公司真实制度，并重建索引。
+2. **知识库为合成语料**：`knowledge/` 按三层组织——`national/`（国家法规）、`local/`（地方细则，上海示例）、`company/`（公司制度），均为节选/示例文档（部分条款已过时如旅客运输抵扣政策），生产使用前需替换为最新法规全文、所在地区真实细则与公司真实制度，并重建索引。
 3. **发票数据会发送至 DashScope API**（识票/嵌入/汇总）；业务数据存储在本地 SQLite 与自建 PostgreSQL。请勿上传真实敏感发票用于演示。
 4. **token 上限为字符估算**（无 Qwen 本地 tokenizer），按保守口径设定（CJK≈1 token/字）；`context.token_budget` 可在 config.yaml 调整。
 5. **pgvector 链路需在有 PostgreSQL 的环境验收**：本仓库 CI 无 PG，`docker compose up -d` 后运行 `uv run pytest --override-ini addopts="-m integration"` 验证 RAG 检索与记忆召回。

@@ -25,11 +25,12 @@ def build_index(knowledge_dir: Path, embed_fn) -> int:
         conn.execute("DELETE FROM knowledge_chunks")
         for i, (chunk, vec) in enumerate(zip(chunks, embeddings, strict=True)):
             conn.execute(
-                "INSERT INTO knowledge_chunks (id, source, doc_title, article_no, content, embedding) "
-                "VALUES (%s, %s, %s, %s, %s, %s::vector)",
+                "INSERT INTO knowledge_chunks (id, source, layer, doc_title, article_no, content, embedding) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s::vector)",
                 (
                     f"chunk_{i}",
                     chunk["source"],
+                    chunk["layer"],
                     chunk["doc_title"],
                     chunk["article_no"] or "",
                     chunk["text"],

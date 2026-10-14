@@ -62,7 +62,7 @@ class HybridRetriever:
                 f"PostgreSQL 不可用（{exc}）。请先启动：docker compose up -d"
             ) from exc
         rows = self._conn.execute(
-            "SELECT id, source, doc_title, article_no, content FROM knowledge_chunks ORDER BY id"
+            "SELECT id, source, layer, doc_title, article_no, content FROM knowledge_chunks ORDER BY id"
         ).fetchall()
         if not rows:
             self._conn.close()
@@ -70,7 +70,14 @@ class HybridRetriever:
                 "知识库为空，请先运行：uv run python scripts/build_knowledge_index.py"
             )
         self._chunks = [
-            {"id": r[0], "source": r[1], "doc_title": r[2], "article_no": r[3], "text": r[4]}
+            {
+                "id": r[0],
+                "source": r[1],
+                "layer": r[2],
+                "doc_title": r[3],
+                "article_no": r[4],
+                "text": r[5],
+            }
             for r in rows
         ]
         self._bm25 = BM25Okapi([_tokenize(c["text"]) for c in self._chunks])
@@ -79,13 +86,18 @@ class HybridRetriever:
     def _vector_search(self, query: str, top_k: int) -> list[RetrievedChunk]:
         vec = self._embed_fn([query])[0]
         rows = self._conn.execute(
-            "SELECT source, doc_title, article_no, content, 1 - (embedding <=> %s::vector) AS score "
+            "SELECT source, layer, doc_title, article_no, content, 1 - (embedding <=> %s::vector) AS score "
             "FROM knowledge_chunks ORDER BY embedding <=> %s::vector LIMIT %s",
             (to_vector_literal(vec), to_vector_literal(vec), top_k),
         ).fetchall()
         return [
             RetrievedChunk(
-                source=r[0], doc_title=r[1], article_no=r[2] or None, text=r[3], score=float(r[4])
+                source=r[0],
+                layer=r[1],
+                doc_title=r[2],
+                article_no=r[3] or None,
+                text=r[4],
+                score=float(r[5]),
             )
             for r in rows
         ]
@@ -100,6 +112,7 @@ class HybridRetriever:
         return [
             RetrievedChunk(
                 source=self._chunks[i]["source"],
+                layer=self._chunks[i]["layer"],
                 doc_title=self._chunks[i]["doc_title"],
                 article_no=self._chunks[i]["article_no"] or None,
                 text=self._chunks[i]["text"],

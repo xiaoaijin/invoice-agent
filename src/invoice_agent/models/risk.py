@@ -45,6 +45,7 @@ class DuplicateHit(BaseModel):
 class RetrievedChunk(BaseModel):
     text: str
     source: str  # 文件名
+    layer: str = ""  # 三层知识库层级：national（国家法规）/ local（地方细则）/ company（公司制度）
     doc_title: str  # 章节/文档标题
     article_no: str | None = None  # "第二十七条"
     score: float = 0.0

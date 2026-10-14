@@ -17,7 +17,7 @@ HEADING_RE = re.compile(r"^#{1,6}\s+")
 
 
 def split_documents(docs: list[dict]) -> list[dict]:
-    """返回 [{"text", "source", "doc_title", "article_no"}]。"""
+    """返回 [{"text", "source", "layer", "doc_title", "article_no"}]。"""
     chunks: list[dict] = []
     for doc in docs:
         lines = doc["text"].splitlines()
@@ -26,13 +26,17 @@ def split_documents(docs: list[dict]) -> list[dict]:
         current_title = doc["source"]
         buf: list[str] = []
         for line in lines:
-            if ARTICLE_RE.match(line.strip()) or HEADING_RE.match(line.strip()):
+            stripped = line.strip()
+            m_article = ARTICLE_RE.match(stripped)
+            is_article = bool(m_article) and m_article.group(0)[-1] in "条款"
+            if HEADING_RE.match(stripped) or m_article:
                 if any(s.strip() for s in buf):
                     blocks.append((current_title, buf))
-                if HEADING_RE.match(line.strip()) and not ARTICLE_RE.match(line.strip()):
-                    current_title = line.lstrip("#").strip()
-                else:
-                    current_title = line.strip().lstrip("#").strip()
+                if HEADING_RE.match(stripped) and not is_article:
+                    # 章/节标题行 → 更新 doc_title
+                    current_title = stripped.lstrip("#").strip()
+                # 条款行（第X条/款）不更新 doc_title：条款编号已提取进 article_no
+                # 元数据，doc_title 保持所属章节，避免引用出现「第五条第五条」重复
                 buf = [line]
             else:
                 buf.append(line)
@@ -50,6 +54,7 @@ def split_documents(docs: list[dict]) -> list[dict]:
                     {
                         "text": piece,
                         "source": doc["source"],
+                        "layer": doc.get("layer", ""),
                         "doc_title": title,
                         "article_no": article_no,
                     }
