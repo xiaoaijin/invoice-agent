@@ -18,6 +18,9 @@ dependencies = [
     "streamlit>=1.37",
     "pillow>=10.3",
     "pyyaml>=6",
+    "fastapi>=0.143.1",
+    "uvicorn>=0.54.0",
+    "python-multipart>=0.0.32",
 ]
 
 [dependency-groups]
@@ -25,6 +28,7 @@ dev = [
     "pytest>=8",
     "ruff>=0.5",
     "reportlab>=4.2",
+    "httpx>=0.28.1",
 ]
 
 [build-system]

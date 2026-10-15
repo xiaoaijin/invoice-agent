@@ -258,13 +258,20 @@ class MonitorStore:
         return [dict(r) for r in rows]
 
     def run_detail(self, run_id: str) -> dict:
-        """单个 run 的节点时间线。"""
+        """单个 run 的节点时间线 + LLM 调用明细。"""
         with self._conn() as conn:
             run = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
             spans = conn.execute(
                 "SELECT * FROM node_spans WHERE run_id=? ORDER BY seq", (run_id,)
             ).fetchall()
-        return {"run": dict(run) if run else None, "spans": [dict(s) for s in spans]}
+            llm_calls = conn.execute(
+                "SELECT * FROM llm_calls WHERE run_id=? ORDER BY id", (run_id,)
+            ).fetchall()
+        return {
+            "run": dict(run) if run else None,
+            "spans": [dict(s) for s in spans],
+            "llm_calls": [dict(c) for c in llm_calls],
+        }
 
     def stats(self, window: int = 20) -> dict:
         """近 window 次 run 的聚合指标。"""

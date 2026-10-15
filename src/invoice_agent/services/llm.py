@@ -1,6 +1,6 @@
 """LangChain 模型工厂：统一走 DashScope OpenAI 兼容模式。
 
-一个 SDK 覆盖视觉（qwen-vl-max）、对话（qwen-max）、嵌入（text-embedding-v3）。
+一个 SDK 覆盖视觉（qwen3.5-omni-plus）、对话（qwen3.8-max）、嵌入（qwen3.7-text-embedding）。
 """
 
 from __future__ import annotations

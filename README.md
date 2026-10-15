@@ -64,7 +64,28 @@ uv run python -m invoice_agent.cli prompts list                              # p
 uv run python -m invoice_agent.cli prompts show qa --version v2              # 查看 prompt 全文
 uv run python -m invoice_agent.cli prompts set-active qa v1                  # 切换激活版本（回写 YAML）
 uv run python -m invoice_agent.cli prompts usage                             # 按 prompt 名+版本统计调用量/成功率/成本
+uv run python -m invoice_agent.cli serve                                     # 启动 HTTP API（默认 127.0.0.1:8000）
 ```
+
+## HTTP API（供 ERP/Java 等外部系统调用）
+
+```bash
+uv run invoice-agent serve --host 127.0.0.1 --port 8000   # FastAPI/uvicorn，交互文档见 /docs
+```
+
+| 端点 | 说明 |
+|---|---|
+| `GET /healthz` | 健康检查（config 可加载 + data 目录可写；不探 PG——PG 挂了主流程自动降级） |
+| `POST /invoices` | multipart 上传发票（`file`，可选 `question`/`session_id`）→ 完整链路，返回识票/验真/查重/风控/回答 JSON |
+| `POST /ask` | `{"question"}` 纯政策问答 |
+| `POST /chat` | `{"message", "session_id"?}` 会话式多轮（同 session_id 共享记忆；缺省时服务端生成并回传） |
+| `GET /chat/{session_id}/history` | 会话历史（与 UI 的 `data/chat_history.db` 互通） |
+| `POST /chat/stream` | SSE 流式对话（`node`/`token`/`done` 三类事件） |
+| `GET /runs/{run_id}` | 查监控 run 明细（节点时间线 + LLM 调用级 token/成本/prompt 版本） |
+
+错误约定：LLM/PG 失败在节点内静默降级返回 200（业务结果含降级提示）；文件超大小上限 413、类型不符 415、run 不存在 404、服务未配置（如缺 API key）503。
+
+> **部署约束**：LangGraph checkpointer 为进程内 `MemorySaver`，多轮会话记忆不跨进程/worker 共享，必须**单 worker** 部署（`serve` 已固定 `workers=1`）；跨重启历史恢复走 `GET /chat/{id}/history`。每个响应带的 `run_id` 可用于 `GET /runs/{id}` 追溯，也是后续异步任务扩展（202 + 轮询）的预留锚点。
 
 ## 演示路径（用合成样本）
 
@@ -123,7 +144,6 @@ START → intake → [route_entry] ─┬→ recognize ⇄（失败重试 ≤2�
 ## Phase 2 路线（未实现）
 
 - PaddleOCR 交叉验证、DashScope gte-rerank 精排
-- FastAPI 服务层（供 ERP/Java 系统调用）
 - 验真接入百望云/诺诺真实 API
 - 企业微信/钉钉/飞书机器人接入、批量异步处理
 - LangGraph checkpointer 跨进程持久化（当前 MemorySaver 为进程内；UI 会话消息已持久化到 `data/chat_history.db`，生产可进一步换 SqliteSaver/PostgresSaver）

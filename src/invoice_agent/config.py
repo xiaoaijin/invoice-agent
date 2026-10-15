@@ -20,9 +20,9 @@ class Settings(BaseSettings):
 
     dashscope_api_key: str = ""
     llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    model_vision: str = "qwen-vl-max"
-    model_chat: str = "qwen-max"
-    embedding_model: str = "text-embedding-v3"
+    model_vision: str = "qwen3.5-omni-plus"
+    model_chat: str = "qwen3.8-max"
+    embedding_model: str = "qwen3.7-text-embedding"
     verify_provider: str = "mock"
     pg_dsn: str = "postgresql://invoice:invoice@localhost:5432/invoice_agent"
 
@@ -121,6 +121,16 @@ class PathsConfig(BaseModel):
     knowledge_dir: str = "knowledge"
 
 
+class UploadConfig(BaseModel):
+    """上传文件校验：大小/类型在 UI 与 API 入口检查，页数上限在 intake 节点兜底。"""
+
+    max_size_mb: int = 10
+    max_pdf_pages: int = 5  # 超出页数只取前 N 页（防大 PDF 全页转 base64 爆内存）
+    allowed_extensions: list[str] = Field(
+        default_factory=lambda: [".png", ".jpg", ".jpeg", ".pdf"]
+    )
+
+
 class AppConfig(BaseModel):
     company: CompanyConfig
     risk: RiskConfig
@@ -129,6 +139,7 @@ class AppConfig(BaseModel):
     monitoring: MonitoringConfig = MonitoringConfig()
     feedback: FeedbackConfig = FeedbackConfig()
     prompts: PromptsConfig = PromptsConfig()
+    upload: UploadConfig = Field(default_factory=UploadConfig)
     paths: PathsConfig
 
     def resolve(self, rel: str) -> Path:

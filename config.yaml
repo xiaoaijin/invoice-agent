@@ -23,6 +23,11 @@ paths:
   db: "data/invoice_agent.db"
   knowledge_dir: "knowledge"
 
+upload:
+  max_size_mb: 10             # 上传文件大小上限（UI/API 入口与 intake 双重校验）
+  max_pdf_pages: 5            # PDF 只取前 N 页转图（防大文件爆内存）
+  allowed_extensions: [".png", ".jpg", ".jpeg", ".pdf"]
+
 context:
   token_budget: 8000          # 单次 LLM 交互 token 上限（字符估算）
   compress_threshold: 0.6     # 历史 token 达预算 60% 时触发摘要压缩
@@ -39,6 +44,7 @@ monitoring:
   log_file: "logs/agent.log"  # 结构化日志（RotatingFileHandler 5MB×3）
   pricing:                    # 每千 token 成本（元），未配置的模型不计成本
     qwen3.5-omni-plus: { input: 0.007, output: 0.04 }  # 文本/图片输入 7 元/M，文本输出 40 元/M（无音频路径）
+    qwen3.8-max: { input: 0.0024, output: 0.0096 }  # TODO: 占位价格（沿 qwen-max 档），待按百炼定价页核实
     qwen3.7-text-embedding: { input: 0.0005, output: 0.0 }  # 文本输入 0.5 元/M（Batch File 0.25 元/M 未单独计价）
   alert:
     node_latency_budget_ms:   # 节点延迟预算（毫秒），未列出的用 default

@@ -20,6 +20,7 @@ sys.path.insert(0, str(SRC_DIR))
 
 from invoice_agent.config import get_app_config
 from invoice_agent.monitoring.setup import setup_logging
+from invoice_agent.runner import NODE_LABELS, node_latency, run_stream
 from invoice_agent.services.conversation_store import ConversationStore
 from invoice_agent.services.dedup_store import DedupStore
 
@@ -28,18 +29,6 @@ setup_logging()
 st.set_page_config(page_title="发票助手 Agent", page_icon="🧾", layout="wide")
 
 MAX_DISPLAY_HISTORY = 50
-
-NODE_LABELS = {
-    "intake": "接收文件",
-    "recognize": "识票提取",
-    "verify": "验真",
-    "dedup": "去重检查",
-    "risk": "风控规则",
-    "risk_review": "风控复核",
-    "retrieve_docs": "政策检索",
-    "finalize": "汇总回答",
-    "critic_answer": "回答自评",
-}
 
 CSS = """
 <style>
@@ -201,54 +190,10 @@ def save_conversation() -> None:
     _conv_store().save(st.session_state.thread_id, _conv_title(display), display)
 
 
-def run_graph(
-    file_path: str | None,
-    question: str | None,
-    thread_id: str,
-    progress_cb=None,
-    on_token=None,
-) -> tuple[dict, object | None]:
-    """流式执行图：节点完成回调 progress_cb，finalize 的 LLM token 回调 on_token。
-
-    使用组合流模式：updates 驱动进度打勾，messages 捕获 finalize 节点的逐 token 输出。
-    """
-    from invoice_agent.graph.builder import build_graph
-    from invoice_agent.monitoring.setup import build_run_config
-
-    config, handler = build_run_config(thread_id, run_type="invoice" if file_path else "ask")
-    graph = build_graph()
-    final: dict = {}
-    for mode, payload in graph.stream(
-        {"session_id": thread_id, "file_path": file_path, "user_question": question},
-        config=config,
-        stream_mode=["updates", "messages"],
-    ):
-        if mode == "updates":
-            for node, delta in payload.items():
-                final.update(delta or {})
-                if progress_cb:
-                    progress_cb(node, handler)
-        elif mode == "messages" and on_token:
-            chunk, meta = payload
-            if meta.get("langgraph_node") == "finalize" and chunk.content:
-                on_token(chunk.content)
-    return final, handler
-
-
-def _node_latency(handler, node: str) -> float | None:
-    """从 handler 事件缓冲中取节点最近一次耗时（ms）。"""
-    if handler is None:
-        return None
-    for e in reversed(handler.events):
-        if e.get("type") == "node_end" and e.get("node") == node:
-            return e.get("latency_ms")
-    return None
-
-
 def _progress_writer(node: str, handler) -> None:
-    """run_graph 的实时进度回调：在 st.status 容器内逐行打勾。"""
+    """run_stream 的实时进度回调：在 st.status 容器内逐行打勾。"""
     label = NODE_LABELS.get(node, node)
-    latency = _node_latency(handler, node)
+    latency = node_latency(handler, node)
     line = f"✅ {label}" if latency is None else f"✅ {label}（{latency:.0f}ms）"
     st.write(line)
 
@@ -476,6 +421,14 @@ def run_turn(
     fname = None
     if file_payload:
         data, fname = file_payload
+        up = cfg.upload
+        suffix = Path(fname).suffix.lower()
+        if suffix not in up.allowed_extensions:
+            st.error(f"不支持的文件类型：{suffix}（支持 {up.allowed_extensions}）")
+            return
+        if len(data) > up.max_size_mb * 1024 * 1024:
+            st.error(f"文件超过大小上限：{up.max_size_mb}MB")
+            return
         updir = Path(cfg.db_path).parent / "uploads"
         updir.mkdir(parents=True, exist_ok=True)
         fpath = updir / f"{uuid.uuid4().hex[:8]}_{fname}"
@@ -505,7 +458,7 @@ def run_turn(
                     holder["ph"] = st.empty()
                 holder["ph"].markdown("".join(streamed))
 
-            state, handler = run_graph(
+            state, handler = run_stream(
                 str(fpath) if fpath else None,
                 text or None,
                 thread_id,
@@ -620,6 +573,30 @@ def render_monitor_tab() -> None:
                     "错误": s["error"] or "",
                 }
                 for s in detail["spans"]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+    if detail["llm_calls"]:
+        st.caption("LLM 调用明细")
+        st.dataframe(
+            [
+                {
+                    "节点": NODE_LABELS.get(c["node"], c["node"]),
+                    "模型": c["model"] or "",
+                    "输入 tokens": c["prompt_tokens"] or 0,
+                    "输出 tokens": c["completion_tokens"] or 0,
+                    "耗时(ms)": round(c["latency_ms"] or 0),
+                    "成本(元)": round(c["cost_yuan"] or 0, 4),
+                    "prompt": (
+                        f"{c['prompt_name']}@{c['prompt_version']}"
+                        if c["prompt_name"]
+                        else ""
+                    ),
+                    "成功": "✓" if c["success"] else "✗",
+                    "错误": c["error"] or "",
+                }
+                for c in detail["llm_calls"]
             ],
             use_container_width=True,
             hide_index=True,
@@ -742,12 +719,12 @@ def render_sidebar() -> None:
         current = st.session_state.thread_id
         for conv in _conv_store().list_conversations(15):
             marker = "●  " if conv["thread_id"] == current else ""
-            if st.button(f"{marker}{conv['title']}", key=f"conv_{conv['thread_id']}",
-                         use_container_width=True):
-                if conv["thread_id"] != current:
-                    st.session_state.thread_id = conv["thread_id"]
-                    st.session_state.display = _conv_store().get_entries(conv["thread_id"])
-                    st.rerun()
+            clicked = st.button(f"{marker}{conv['title']}", key=f"conv_{conv['thread_id']}",
+                                use_container_width=True)
+            if clicked and conv["thread_id"] != current:
+                st.session_state.thread_id = conv["thread_id"]
+                st.session_state.display = _conv_store().get_entries(conv["thread_id"])
+                st.rerun()
 
         # 底部用户信息
         st.divider()

@@ -54,6 +54,11 @@ class TestMonitorStore:
 
         detail = store.run_detail("r1")
         assert [s["node"] for s in detail["spans"]] == ["recognize", "recognize"]
+        # llm_calls 明细随 run_detail 一起返回（含 prompt 追溯三列）
+        assert len(detail["llm_calls"]) == 1
+        call = detail["llm_calls"][0]
+        assert call["model"] == "qwen-vl-max"
+        assert call["total_tokens"] == 150
 
         stats = store.stats(20)
         assert stats["run_count"] == 1
@@ -62,6 +67,28 @@ class TestMonitorStore:
 
         alerts = store.recent_alerts(10)
         assert alerts[0]["alert_type"] == "slow_node"
+
+    def test_run_detail_includes_prompt_trace(self, tmp_path: Path):
+        store = MonitorStore(tmp_path / "m.db")
+        store.start_run("r1", "t1", "ask")
+        store.write_llm_call(
+            "r1",
+            "finalize",
+            "qwen3.8-max",
+            100,
+            50,
+            150,
+            900.0,
+            0.001,
+            True,
+            prompt_name="qa",
+            prompt_version="v2",
+            prompt_hash="abc123",
+        )
+        call = store.run_detail("r1")["llm_calls"][0]
+        assert call["prompt_name"] == "qa"
+        assert call["prompt_version"] == "v2"
+        assert call["prompt_hash"] == "abc123"
 
     def test_write_failure_does_not_raise(self, tmp_path: Path):
         store = MonitorStore(tmp_path / "m.db")
@@ -99,18 +126,23 @@ def _chat_result(model: str = "qwen-max", prompt: int = 100, completion: int = 5
     return ChatResult(generations=[ChatGeneration(message=msg)], llm_output={"model_name": model})
 
 
-def _simulate_run(handler: TraceCallbackHandler, fail_node: bool = False):
+def _simulate_run(
+    handler: TraceCallbackHandler,
+    fail_node: bool = False,
+    serialized=None,
+    chat_result: ChatResult | None = None,
+):
     """直接调回调方法模拟一次 run：root → recognize(含 LLM) → root end。"""
     root = uuid.uuid4()
     node = uuid.uuid4()
     llm = uuid.uuid4()
     handler.on_chain_start(None, {}, run_id=root, parent_run_id=None, name="LangGraph")
     handler.on_chain_start(None, {}, run_id=node, parent_run_id=root, name="recognize")
-    handler.on_chat_model_start(None, [], run_id=llm, parent_run_id=node)
+    handler.on_chat_model_start(serialized, [], run_id=llm, parent_run_id=node)
     if fail_node:
         handler.on_chain_error(RuntimeError("节点炸了"), run_id=node, parent_run_id=root)
     else:
-        handler.on_chat_model_end(_chat_result(), run_id=llm, parent_run_id=node)
+        handler.on_chat_model_end(chat_result or _chat_result(), run_id=llm, parent_run_id=node)
         handler.on_chain_end({}, run_id=node, parent_run_id=root, name="recognize")
     handler.on_chain_end({}, run_id=root, parent_run_id=None, name="LangGraph")
 
@@ -122,6 +154,24 @@ class TestTraceCallbackHandler:
             alert=AlertConfig(**alert_kw),
         )
         return TraceCallbackHandler(MonitorStore(tmp_path / "m.db"), cfg, "t1", "invoice")
+
+    def test_model_name_from_serialized_kwargs(self, tmp_path: Path):
+        """ChatOpenAI 序列化后模型名在 kwargs.model_name（非 model），取错键会导致成本记 0。
+
+        用 llm_output 为空的 ChatResult 模拟流式响应（llm_output 无 model_name 时
+        以开始回调从 serialized 提取的为准）。
+        """
+        handler = self._handler(tmp_path)
+        _simulate_run(
+            handler,
+            serialized={"kwargs": {"model_name": "qwen3.8-max"}},
+            chat_result=ChatResult(
+                generations=[ChatGeneration(message=AIMessage(content="ok"))], llm_output={}
+            ),
+        )
+        with handler.store._conn() as conn:
+            row = dict(conn.execute("SELECT * FROM llm_calls").fetchone())
+        assert row["model"] == "qwen3.8-max"
 
     def test_full_run_persists(self, tmp_path: Path):
         handler = self._handler(tmp_path)

@@ -13,46 +13,21 @@ import json
 import sys
 import time
 
-NODE_LABELS = {
-    "intake": "接收文件",
-    "recognize": "识票提取",
-    "verify": "验真",
-    "dedup": "去重检查",
-    "risk": "风控规则",
-    "risk_review": "风控复核",
-    "retrieve_docs": "政策检索",
-    "finalize": "汇总回答",
-    "critic_answer": "回答自评",
-}
+from invoice_agent.runner import NODE_LABELS, node_latency, run_stream
 
 
 def _stream_graph(file_path: str | None, question: str | None, thread_id: str) -> dict:
     """流式执行图：节点进度打 stderr（stdout 保持只输出最终答案），返回聚合 state。"""
-    from invoice_agent.graph.builder import build_graph
-    from invoice_agent.monitoring.setup import build_run_config
 
-    run_type = "invoice" if file_path else "ask"
-    config, handler = build_run_config(thread_id, run_type=run_type)
-    graph = build_graph()
-    final: dict = {}
+    def _progress(node: str, handler) -> None:
+        latency = node_latency(handler, node)
+        msg = f"[节点] {NODE_LABELS.get(node, node)} ✓"
+        if latency is not None:
+            msg += f" {latency:.0f}ms"
+        print(msg, file=sys.stderr)
+
     started = time.perf_counter()
-    for update in graph.stream(
-        {"session_id": thread_id, "file_path": file_path, "user_question": question},
-        config=config,
-        stream_mode="updates",
-    ):
-        for node, delta in update.items():
-            final.update(delta or {})
-            latency = None
-            if handler:
-                for e in reversed(handler.events):
-                    if e.get("type") == "node_end" and e.get("node") == node:
-                        latency = e.get("latency_ms")
-                        break
-            msg = f"[节点] {NODE_LABELS.get(node, node)} ✓"
-            if latency is not None:
-                msg += f" {latency:.0f}ms"
-            print(msg, file=sys.stderr)
+    final, handler = run_stream(file_path, question, thread_id, progress_cb=_progress)
     elapsed = time.perf_counter() - started
     info = f"[完成] 总耗时 {elapsed:.1f}s"
     if handler:
@@ -184,6 +159,20 @@ def cmd_chat(args: argparse.Namespace) -> int:
         print(f"\n助手> {state.get('answer') or '(无输出)'}")
 
 
+def cmd_serve(args: argparse.Namespace) -> int:
+    """启动 HTTP API（uvicorn）。注意 checkpointer 为进程内实现，须单 worker 部署。"""
+    import uvicorn
+
+    uvicorn.run(
+        "invoice_agent.api.app:create_app",
+        factory=True,
+        host=args.host,
+        port=args.port,
+        workers=1,
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="invoice-agent", description="发票助手 Agent")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -221,6 +210,11 @@ def main(argv: list[str] | None = None) -> int:
     p_prompts_sub.add_parser("usage", help="按 prompt 名+版本查看调用量/成功率/成本").set_defaults(
         func=cmd_prompts_usage
     )
+
+    p_serve = sub.add_parser("serve", help="启动 HTTP API（FastAPI/uvicorn，单 worker）")
+    p_serve.add_argument("--host", default="127.0.0.1")
+    p_serve.add_argument("--port", type=int, default=8000)
+    p_serve.set_defaults(func=cmd_serve)
 
     args = parser.parse_args(argv)
     return args.func(args)

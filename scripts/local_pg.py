@@ -17,8 +17,8 @@
 import sys
 from pathlib import Path
 
-import psycopg
 import pgserver
+import psycopg
 
 ROOT = Path(__file__).resolve().parent.parent
 PGDATA = ROOT / ".pgdata"
@@ -42,7 +42,7 @@ def main() -> int:
     if (PGDATA / "postmaster.pid").exists():
         try:
             ready = pgserver.pg_isready(["-h", "localhost", "-p", "5432"])
-        except Exception as err:
+        except Exception as err:  # noqa: BLE001 — 探测失败按未启动处理
             print(f"[local_pg] pg_isready 探测失败，按未启动处理: {err}")
     if "accepting connections" in ready:
         print("[local_pg] PostgreSQL 已在运行 (localhost:5432)")

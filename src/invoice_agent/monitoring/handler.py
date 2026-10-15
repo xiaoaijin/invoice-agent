@@ -204,7 +204,9 @@ class TraceCallbackHandler(BaseCallbackHandler):
     def _on_model_start(self, run_id, serialized) -> None:
         model = "?"
         try:
-            model = (serialized or {}).get("kwargs", {}).get("model") or "?"
+            # ChatOpenAI 序列化后模型名在 model_name（老版本为 model），兜底 llm_output.model_name
+            kwargs = (serialized or {}).get("kwargs", {})
+            model = kwargs.get("model_name") or kwargs.get("model") or "?"
         except Exception as exc:  # noqa: BLE001
             logger.debug("监控回调异常（解析模型名）：%s", exc)
         self._llm_starts[run_id] = {"started_ns": time.perf_counter_ns(), "model": model}

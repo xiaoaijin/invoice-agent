@@ -17,6 +17,7 @@ class AgentState(TypedDict, total=False):
     # 识票
     file_type: str  # png/jpg/jpeg/pdf
     page_images: list[str]  # base64 data URL（PDF 拆页后）
+    pages_truncated: int  # PDF 超出 max_pdf_pages 被截掉的页数（0/缺省=未截断）
     invoice: InvoiceData | None
     extract_error: str | None
     recognize_retry: int  # 提取重试计数（上限 2）
