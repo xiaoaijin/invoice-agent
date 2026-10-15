@@ -88,6 +88,72 @@ def cmd_ask(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---- prompt 版本管理 ----
+
+
+def _print_table(headers: list[str], rows: list[list[str]]) -> None:
+    widths = [max(len(h), *(len(r[i]) for r in rows)) if rows else len(h)
+              for i, h in enumerate(headers)]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    print(fmt.format(*headers))
+    print(fmt.format(*("-" * w for w in widths)))
+    for row in rows:
+        print(fmt.format(*row))
+
+
+def cmd_prompts_list(args: argparse.Namespace) -> int:
+    from invoice_agent.prompts.registry import get_registry
+
+    rows = [
+        [r["name"], r["active"], r["active_hash"], str(r["versions"]),
+         str(r["weights"]), r["description"]]
+        for r in get_registry().list_prompts()
+    ]
+    _print_table(["name", "active", "hash", "versions", "weights", "description"], rows)
+    return 0
+
+
+def cmd_prompts_show(args: argparse.Namespace) -> int:
+    from invoice_agent.prompts.registry import get_registry
+
+    meta = get_registry().get(args.name, version=args.version)
+    print(f"# {meta.name} @ {meta.version}（hash {meta.hash}）\n")
+    print(meta.text)
+    return 0
+
+
+def cmd_prompts_set_active(args: argparse.Namespace) -> int:
+    from invoice_agent.prompts.registry import get_registry
+
+    get_registry().set_active(args.name, args.version)
+    meta = get_registry().get(args.name)
+    print(f"已切换 {args.name} 激活版本 → {args.version}（hash {meta.hash}）")
+    return 0
+
+
+def cmd_prompts_usage(args: argparse.Namespace) -> int:
+    from invoice_agent.config import get_app_config
+    from invoice_agent.monitoring.store import MonitorStore
+
+    store = MonitorStore(get_app_config().monitoring_db_path)
+    rows = [
+        [
+            r["prompt_name"] or "?",
+            r["prompt_version"] or "?",
+            str(r["calls"]),
+            f"{r['success_rate']:.2f}" if r["success_rate"] is not None else "-",
+            f"{r['avg_latency_ms']:.0f}ms" if r["avg_latency_ms"] is not None else "-",
+            f"¥{r['cost_yuan']:.4f}",
+        ]
+        for r in store.prompt_usage()
+    ]
+    if not rows:
+        print("（暂无 prompt 调用记录）")
+        return 0
+    _print_table(["name", "version", "calls", "success_rate", "avg_latency", "cost"], rows)
+    return 0
+
+
 def cmd_chat(args: argparse.Namespace) -> int:
     """多轮对话 REPL：/invoice <文件> 查验发票，/new 重置会话，/quit 退出。"""
     thread_id = f"cli-chat-{args.session}"
@@ -138,6 +204,23 @@ def main(argv: list[str] | None = None) -> int:
     p_chat = sub.add_parser("chat", help="多轮对话模式（支持追问与发票查验）")
     p_chat.add_argument("--session", default="default", help="会话名（同一会话保留记忆）")
     p_chat.set_defaults(func=cmd_chat)
+
+    p_prompts = sub.add_parser("prompts", help="prompt 版本管理（查看/切换/用量）")
+    p_prompts_sub = p_prompts.add_subparsers(dest="action", required=True)
+    p_prompts_sub.add_parser("list", help="列出全部 prompt 及激活版本").set_defaults(
+        func=cmd_prompts_list
+    )
+    p_show = p_prompts_sub.add_parser("show", help="查看 prompt 全文（默认激活版本）")
+    p_show.add_argument("name")
+    p_show.add_argument("--version", default=None, help="指定版本号")
+    p_show.set_defaults(func=cmd_prompts_show)
+    p_active = p_prompts_sub.add_parser("set-active", help="切换激活版本（回写 YAML）")
+    p_active.add_argument("name")
+    p_active.add_argument("version")
+    p_active.set_defaults(func=cmd_prompts_set_active)
+    p_prompts_sub.add_parser("usage", help="按 prompt 名+版本查看调用量/成功率/成本").set_defaults(
+        func=cmd_prompts_usage
+    )
 
     args = parser.parse_args(argv)
     return args.func(args)

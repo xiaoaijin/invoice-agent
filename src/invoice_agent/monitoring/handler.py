@@ -20,6 +20,7 @@ from langchain_core.callbacks import BaseCallbackHandler
 from invoice_agent.config import MonitoringConfig
 from invoice_agent.monitoring.cost import calc_cost
 from invoice_agent.monitoring.store import MonitorStore
+from invoice_agent.prompts.registry import current_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -233,6 +234,7 @@ class TraceCallbackHandler(BaseCallbackHandler):
             start = self._llm_starts.pop(run_id, None)
             latency = (time.perf_counter_ns() - start["started_ns"]) / 1e6 if start else 0.0
             node = self._current_node()
+            meta = current_prompt()
             self.store.write_llm_call(
                 self.run_id,
                 node,
@@ -244,6 +246,9 @@ class TraceCallbackHandler(BaseCallbackHandler):
                 0.0,
                 False,
                 str(error),
+                prompt_name=meta.name if meta else None,
+                prompt_version=meta.version if meta else None,
+                prompt_hash=meta.hash if meta else None,
             )
             self._event(type="llm_end", node=node, success=False)
         except Exception as exc:  # noqa: BLE001
@@ -290,8 +295,21 @@ class TraceCallbackHandler(BaseCallbackHandler):
             self._cost_total += cost
 
             node = self._current_node()
+            # prompt 追溯：registry 在 use() 里登记 contextvar，此处读出落库（无则 NULL）
+            meta = current_prompt()
             self.store.write_llm_call(
-                self.run_id, node, model, prompt, completion, total, latency, cost, True
+                self.run_id,
+                node,
+                model,
+                prompt,
+                completion,
+                total,
+                latency,
+                cost,
+                True,
+                prompt_name=meta.name if meta else None,
+                prompt_version=meta.version if meta else None,
+                prompt_hash=meta.hash if meta else None,
             )
             self._event(
                 type="llm_end",

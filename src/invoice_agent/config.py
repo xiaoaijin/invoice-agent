@@ -108,6 +108,14 @@ class CompanyConfig(BaseModel):
     tax_id: str
 
 
+class PromptsConfig(BaseModel):
+    """prompt 版本管理：YAML 文件为源（prompts/ 目录），此处只放运行时开关。"""
+
+    dir: str = "prompts"
+    ab_enabled: bool = False  # A/B 抽样总开关（按 versions[].weight 加权）
+    overrides: dict[str, str] = Field(default_factory=dict)  # 强制版本，优先级最高，如 qa: v2
+
+
 class PathsConfig(BaseModel):
     db: str = "data/invoice_agent.db"
     knowledge_dir: str = "knowledge"
@@ -120,6 +128,7 @@ class AppConfig(BaseModel):
     memory: MemoryConfig = MemoryConfig()
     monitoring: MonitoringConfig = MonitoringConfig()
     feedback: FeedbackConfig = FeedbackConfig()
+    prompts: PromptsConfig = PromptsConfig()
     paths: PathsConfig
 
     def resolve(self, rel: str) -> Path:
@@ -138,6 +147,10 @@ class AppConfig(BaseModel):
     @property
     def knowledge_dir(self) -> Path:
         return self.resolve(self.paths.knowledge_dir)
+
+    @property
+    def prompts_dir(self) -> Path:
+        return self.resolve(self.prompts.dir)
 
 
 def load_app_config(path: Path | None = None) -> AppConfig:

@@ -15,13 +15,6 @@ from invoice_agent.config import ContextConfig
 
 logger = logging.getLogger(__name__)
 
-SUMMARY_SYSTEM_PROMPT = """你是对话摘要器。请把提供的历史对话压缩为一段简洁摘要，供后续对话作为背景知识。
-
-要求：
-1. 保留与发票报销相关的关键事实：已查验的发票号码/结论、已做出的判断、用户关注的问题。
-2. 工具调用（[工具 xxx] 开头的条目）只保留工具名和结果，不展开过程。
-3. 用简体中文，不超过 300 字，直接输出摘要正文。"""
-
 
 def estimate_tokens(text: str) -> int:
     """确定性 token 估算：CJK 字符 ≈1 token/字，其他 ≈4 字符/token。"""
@@ -77,24 +70,38 @@ def compress_history(state: dict, summarize_fn, config: ContextConfig) -> dict:
     return {"chat_history": recent, "history_summary": summary}
 
 
-def build_summary_prompt(prev_summary: str, old_entries: list[dict]) -> list:
-    """构造摘要 LLM 调用的消息列表。"""
+def build_summary_prompt(
+    prev_summary: str, old_entries: list[dict], system_prompt: str | None = None
+) -> list:
+    """构造摘要 LLM 调用的消息列表。system_prompt 为 None 时从 registry 取 summarize 当前版本。"""
     from langchain_core.messages import HumanMessage, SystemMessage
+
+    if system_prompt is None:
+        from invoice_agent.prompts.registry import get_registry
+
+        system_prompt = get_registry().get("summarize").text
 
     parts = []
     if prev_summary:
         parts.append(f"【此前摘要】\n{prev_summary}\n")
     parts.append("【待压缩历史对话】\n" + "\n".join(_render_entry(e) for e in old_entries))
-    return [SystemMessage(content=SUMMARY_SYSTEM_PROMPT), HumanMessage(content="\n".join(parts))]
+    return [SystemMessage(content=system_prompt), HumanMessage(content="\n".join(parts))]
 
 
 def default_summarizer():
     """生产用摘要函数（调 qwen-max）。"""
+    from invoice_agent.prompts.registry import use
     from invoice_agent.services.llm import get_chat_model
 
     def summarize(prev_summary: str, old_entries: list[dict]) -> str:
         try:
-            return get_chat_model().invoke(build_summary_prompt(prev_summary, old_entries)).content
+            # use() 登记当前 prompt 到 contextvar（监控追溯），with 块包住 LLM invoke
+            with use("summarize") as prompt:
+                return (
+                    get_chat_model()
+                    .invoke(build_summary_prompt(prev_summary, old_entries, prompt.text))
+                    .content
+                )
         except Exception as exc:  # noqa: BLE001 — 摘要失败时降级为截断拼接
             logger.warning("历史摘要生成失败，降级为首尾拼接：%s", exc)
             text = "\n".join(_render_entry(e) for e in old_entries[-6:])

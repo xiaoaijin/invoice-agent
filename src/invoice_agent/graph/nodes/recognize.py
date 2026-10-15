@@ -8,19 +8,8 @@ from invoice_agent.config import get_app_config
 from invoice_agent.feedback.critics import default_llm_fn, field_self_check
 from invoice_agent.graph.state import AgentState
 from invoice_agent.models.invoice import InvoiceData
+from invoice_agent.prompts.registry import use
 from invoice_agent.services.llm import get_vision_model
-
-SYSTEM_PROMPT = """你是增值税发票识别专家。请从图片中精确提取发票信息并输出为结构化数据。
-
-字段说明与规则：
-1. invoice_type：根据票面标题判断（增值税专用发票/普通发票/电子发票/数电票等）。
-2. 数电票没有发票代码（invoice_code 填 null），发票号码为 20 位；其他票发票号码通常为 8 位。
-3. 价税合计在票面右下角"价税合计（大写）…（小写）¥…"处；不含税金额在"合计"行；税额在"税额"行。三者不要混淆。
-4. 普通发票抬头为"个人"时购买方税号填 null。
-5. 缺失或无法辨认的字段一律填 null，**严禁猜测编造**。
-6. 为每个关键字段给出 0~1 的置信度（field_confidence），整体置信度 overall_confidence 取关键字段的最小值。
-7. 明细行可能跨页/多行，请全部列出。
-8. 日期格式为 ISO（YYYY-MM-DD）。"""
 
 
 def check_extract(invoice: InvoiceData) -> list[str]:
@@ -52,15 +41,18 @@ def recognize(state: AgentState) -> dict:
     if prev_error:
         content[0]["text"] += f"\n\n上一次提取存在以下问题，请特别注意：\n{prev_error}"
 
-    messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=content)]
-    try:
-        invoice = get_vision_model().with_structured_output(InvoiceData).invoke(messages)
-    except Exception as exc:  # noqa: BLE001 — 网络/解析错误统一走重试
-        return {
-            "extract_error": f"模型调用失败：{exc}",
-            "invoice": None,
-            "recognize_retry": state.get("recognize_retry", 0) + 1,
-        }
+    # prompt 版本管理：use() 解析当前版本并登记 contextvar（监控据此落库），
+    # with 块包住 LLM invoke，A/B 抽样按 session_id 粘性分桶
+    with use("recognize", sticky_key=state.get("session_id")) as prompt:
+        messages = [SystemMessage(content=prompt.text), HumanMessage(content=content)]
+        try:
+            invoice = get_vision_model().with_structured_output(InvoiceData).invoke(messages)
+        except Exception as exc:  # noqa: BLE001 — 网络/解析错误统一走重试
+            return {
+                "extract_error": f"模型调用失败：{exc}",
+                "invoice": None,
+                "recognize_retry": state.get("recognize_retry", 0) + 1,
+            }
 
     errors = check_extract(invoice)
     # 自反馈：代码级校验通过后再做 LLM 级字段自检（缺失/逻辑矛盾），

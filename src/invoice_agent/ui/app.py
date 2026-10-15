@@ -488,6 +488,75 @@ def render_monitor_tab() -> None:
         )
 
 
+def render_prompts_tab() -> None:
+    """prompt 版本面板：版本清单、全文查看、A/B 调用分布（只读，切换走 CLI/文件）。"""
+    from invoice_agent.prompts.registry import get_registry
+
+    registry = get_registry()
+    prompts = registry.list_prompts()
+    if not prompts:
+        st.caption("prompts 目录为空")
+        return
+
+    st.subheader("📚 版本清单")
+    st.dataframe(
+        [
+            {
+                "名称": p["name"],
+                "说明": p["description"],
+                "激活版本": p["active"],
+                "文本hash": p["active_hash"],
+                "版本数": p["versions"],
+                "A/B权重": ", ".join(f"{v}={w}" for v, w in p["weights"].items()),
+            }
+            for p in prompts
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.caption("版本切换走 CLI（`prompts set-active`）或直接编辑 YAML，此处只读。")
+
+    st.subheader("📄 全文查看")
+    name = st.selectbox("选择 prompt", [p["name"] for p in prompts])
+    versions = registry.versions(name)
+    labels = {
+        v.version: f"{v.version}（权重 {max(1, v.weight)}）{('：' + v.description) if v.description else ''}"
+        for v in versions
+    }
+    version = st.radio("版本", [v.version for v in versions], format_func=lambda v: labels[v])
+    meta = registry.get(name, version=version)
+    st.code(meta.text, language="text")
+    st.caption(f"hash：{meta.hash}")
+
+    st.subheader("⚖️ A/B 调用分布")
+    try:
+        from invoice_agent.monitoring.store import MonitorStore
+
+        store = MonitorStore(get_app_config().monitoring_db_path)
+        usage = store.prompt_usage()
+    except Exception as exc:  # noqa: BLE001 — 监控降级时提示即可
+        st.caption(f"监控不可用（{exc}）")
+        return
+    rows = [u for u in usage if u["prompt_name"] == name]
+    if not rows:
+        st.caption("该 prompt 暂无调用记录")
+        return
+    st.dataframe(
+        [
+            {
+                "版本": u["prompt_version"] or "?",
+                "调用量": u["calls"],
+                "成功率": f"{u['success_rate']:.0%}" if u["success_rate"] is not None else "—",
+                "平均耗时(ms)": round(u["avg_latency_ms"] or 0),
+                "成本(元)": round(u["cost_yuan"] or 0, 4),
+            }
+            for u in rows
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
 def render_sidebar() -> None:
     with st.sidebar:
         st.markdown("## 🧾 发票助手")
@@ -527,11 +596,13 @@ def main() -> None:
     cfg = get_app_config()
     render_sidebar()
 
-    tab_chat, tab_monitor = st.tabs(["💬 助手对话", "📈 监控面板"])
+    tab_chat, tab_monitor, tab_prompts = st.tabs(["💬 助手对话", "📈 监控面板", "📜 Prompt 版本"])
     with tab_chat:
         render_conversation_tab(cfg)
     with tab_monitor:
         render_monitor_tab()
+    with tab_prompts:
+        render_prompts_tab()
 
 
 main()

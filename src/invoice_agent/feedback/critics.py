@@ -17,40 +17,12 @@ from pydantic import BaseModel, Field
 from invoice_agent.graph.state import AgentState
 from invoice_agent.models.invoice import InvoiceData
 from invoice_agent.models.risk import Finding, RiskLevel
+from invoice_agent.prompts.registry import use
 
 logger = logging.getLogger(__name__)
 
 # llm_fn：接收消息列表，返回回答文本。None = LLM 不可用（降级）。
 LlmFn = Callable[[list], str] | None
-
-CRITIQUE_SYSTEM_PROMPT = """你是严格的回答质量评审员。给定用户问题、助手回答与系统已掌握的事实（发票数据、验真结论、风控发现、检索条款），
-从三个维度打 0~1 分：
-- sufficiency：信息是否充分回答了问题；
-- relevance：是否答非所问；
-- completeness：风险提示是否完整（若事实中存在"高"级风控发现而回答未提及，则 completeness ≤ 0.4）。
-issues 用中文逐条列出可改进点；无不足则为空数组。
-只输出 JSON：{"sufficiency": 0.x, "relevance": 0.x, "completeness": 0.x, "score": 0.x, "issues": ["..."]}
-score 取三个维度的加权综合（sufficiency 0.4 / relevance 0.3 / completeness 0.3）。"""
-
-FIELD_CHECK_SYSTEM_PROMPT = """你是发票数据质检员。给定 OCR 识别出的发票 JSON，只检查以下两类问题：
-1) 关键字段缺失或可疑 null。关键字段仅指：发票类型、发票号码、开票日期、购买方/销售方名称与税号、
-价税合计/合计金额、明细中的商品名称与金额。明细行的单位、规格、数量等非核心字段缺失不算问题，勿报；
-2) 票面内部逻辑矛盾，仅限：开票日期晚于当前日期、金额勾稽不符（明细/合计/税额互相矛盾）、
-税率与商品常识明显矛盾（如餐饮服务出现 13%）。
-
-严禁检查以下内容（由代码级校验负责，报了也会被忽略）：
-- 号码/税号/信用代码的位数与字符编码规则（8 位专票、20 位数电票、18 位信用代码均正常，含 W/X/Y 字符合法）；
-- 票面没有的信息、真实性判断、与外部数据的一致性。
-每条问题一句话中文描述。只输出 JSON：{"issues": ["..."]}。无问题输出 {"issues": []}。"""
-
-RISK_REVIEW_SYSTEM_PROMPT = """你是风控复核员。给定发票 JSON 与规则引擎输出的风险发现列表（含证据），复核：
-1) 误报：规则机械命中但业务上不成立 → 从 adjusted 中移除，并在 removed 列出其 rule_id；
-2) 漏报：票面明显异常但规则未覆盖 → 以 rule_id="LLM-REVIEW" 补充到 added（level 按严重度"高"/"中"/"低"，
-message 注明是模型复核发现、需人工确认）；
-3) summary 用一句话给出复核结论。
-只基于给定票面数据判断，不确定的降级为"低"并在 message 注明。
-只输出 JSON：{"adjusted": [...], "removed": ["R00x"], "added": [...], "summary": "..."}
-adjusted 为复核后完整的发现列表（保留项沿用原字段）。"""
 
 LEVEL_BY_VALUE = {lv.value: lv for lv in RiskLevel}
 
@@ -137,13 +109,15 @@ def critique_answer(
         f"## 助手回答\n{answer}\n\n"
         f"## 系统事实\n" + ("\n".join(fact_parts) or "（无）")
     )
+    # use() 登记当前 prompt 到 contextvar（监控追溯），with 块包住 llm_fn 调用
     try:
-        raw = llm_fn(
-            [
-                {"role": "system", "content": CRITIQUE_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ]
-        )
+        with use("critique") as system_prompt:
+            raw = llm_fn(
+                [
+                    {"role": "system", "content": system_prompt.text},
+                    {"role": "user", "content": user_prompt},
+                ]
+            )
     except Exception as exc:  # noqa: BLE001
         logger.warning("回答自评 LLM 调用失败（放行）：%s", exc)
         return CritiqueResult()
@@ -182,15 +156,16 @@ def field_self_check(invoice: InvoiceData, llm_fn: LlmFn) -> list[str]:
     if llm_fn is None:
         return []
     try:
-        raw = llm_fn(
-            [
-                {"role": "system", "content": FIELD_CHECK_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": f"当前日期：{_today()}\n发票 JSON：\n{invoice.model_dump_json(indent=2)}",
-                },
-            ]
-        )
+        with use("field_check") as system_prompt:
+            raw = llm_fn(
+                [
+                    {"role": "system", "content": system_prompt.text},
+                    {
+                        "role": "user",
+                        "content": f"当前日期：{_today()}\n发票 JSON：\n{invoice.model_dump_json(indent=2)}",
+                    },
+                ]
+            )
     except Exception as exc:  # noqa: BLE001
         logger.warning("字段自检 LLM 调用失败（跳过）：%s", exc)
         return []
@@ -225,22 +200,22 @@ def review_risk(findings: list[Finding], invoice: InvoiceData | None, llm_fn: Ll
     user_prompt = (
         f"发票 JSON：\n{invoice.model_dump_json(indent=2)}\n\n风险发现列表：\n{findings_json}"
     )
-    messages = [
-        {"role": "system", "content": RISK_REVIEW_SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
-    ]
-
     data: dict[str, Any] | None = None
-    for attempt in range(2):  # 解析失败重试 1 次
-        try:
-            raw = llm_fn(messages)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("风控复核 LLM 调用失败（原样透传）：%s", exc)
-            return RiskReview(adjusted=list(findings))
-        data = _extract_json(raw)
-        if data is not None:
-            break
-        logger.warning("风控复核输出无法解析（第 %d 次）：%s", attempt + 1, raw[:200])
+    with use("risk_review") as system_prompt:  # with 块包住全部重试调用
+        messages = [
+            {"role": "system", "content": system_prompt.text},
+            {"role": "user", "content": user_prompt},
+        ]
+        for attempt in range(2):  # 解析失败重试 1 次
+            try:
+                raw = llm_fn(messages)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("风控复核 LLM 调用失败（原样透传）：%s", exc)
+                return RiskReview(adjusted=list(findings))
+            data = _extract_json(raw)
+            if data is not None:
+                break
+            logger.warning("风控复核输出无法解析（第 %d 次）：%s", attempt + 1, raw[:200])
     if data is None:
         return RiskReview(adjusted=list(findings))
 

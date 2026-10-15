@@ -15,6 +15,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from invoice_agent.config import get_app_config
 from invoice_agent.graph.state import AgentState
+from invoice_agent.prompts.registry import use
 from invoice_agent.services.context_manager import (
     compress_history,
     default_summarizer,
@@ -22,7 +23,7 @@ from invoice_agent.services.context_manager import (
     fit_budget,
 )
 from invoice_agent.services.llm import get_chat_model
-from invoice_agent.services.rag.qa import QA_SYSTEM_PROMPT, format_chunks_for_prompt
+from invoice_agent.services.rag.qa import format_chunks_for_prompt
 from invoice_agent.services.rag.retriever import get_retriever
 
 logger = logging.getLogger(__name__)
@@ -180,15 +181,18 @@ def finalize(state: AgentState) -> dict:
     # 预算兜底：完整 prompt 超上限时从头截断
     prompt_text = fit_budget(prompt_text, cfg.context.token_budget)
 
-    messages = [
-        SystemMessage(content=QA_SYSTEM_PROMPT),
-        *_history_messages(history),
-        HumanMessage(content=prompt_text),
-    ]
-    try:
-        answer = get_chat_model().invoke(messages).content
-    except Exception as exc:  # noqa: BLE001
-        answer = _fallback_answer(state) + f"\n\n（LLM 汇总失败：{exc}）"
+    # prompt 版本管理：use() 解析 qa 当前版本并登记 contextvar（监控据此落库），
+    # A/B 抽样按 session_id 粘性分桶（finalize 重生成轮不换 prompt）
+    with use("qa", sticky_key=state.get("session_id")) as qa_prompt:
+        messages = [
+            SystemMessage(content=qa_prompt.text),
+            *_history_messages(history),
+            HumanMessage(content=prompt_text),
+        ]
+        try:
+            answer = get_chat_model().invoke(messages).content
+        except Exception as exc:  # noqa: BLE001
+            answer = _fallback_answer(state) + f"\n\n（LLM 汇总失败：{exc}）"
 
     # ---- 记忆写入（pgvector，尽力而为）----
     # 自评未通过时跳过：中间版答案不污染长期记忆，最终通过版的重生成轮会写入
