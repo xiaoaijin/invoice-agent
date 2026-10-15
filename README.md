@@ -1,6 +1,6 @@
 # 发票助手 Agent（MVP + 知识增强风控）
 
-基于 **LangGraph + Qwen-VL-Max（DashScope 兼容模式）** 的发票助手：智能识票、验真、重复报销检测、风控预警、带引用的政策问答。
+基于 **LangGraph + Qwen 系列（阿里云 MaaS 专属端点 / DashScope 兼容模式）** 的发票助手：智能识票、验真、重复报销检测、风控预警、带引用的政策问答。模型经 `.env` 配置：识票 `MODEL_VISION`（默认 qwen3.5-omni-plus）、问答 `MODEL_CHAT`（默认 qwen3.8-max）、嵌入 `EMBEDDING_MODEL`（默认 qwen3.7-text-embedding）。
 
 ## 功能
 
@@ -13,7 +13,10 @@
 | 多轮对话 | checkpointer（MemorySaver）按 thread_id 持久化会话；支持追问（检索 query 自动拼上上一问题）；发票查验后可在对话中继续追问 |
 | 上下文管理 | 单次交互 token 上限（字符估算）；历史达预算 60% 时自动压缩：最近 10 轮原样保留，更早内容滚动摘要化，工具调用只留工具名+结果；prompt 组装后还有预算兜底截断 |
 | 长期记忆 | 每轮问答以向量存入 PostgreSQL (pgvector)，跨会话语义召回相关历史；会话滚动摘要持久化，重启不丢；PG 不可用时自动降级 |
-| 界面 | Streamlit：上传查验 + 确认报销入台账 + 多轮对话聊天（可一键新会话） |
+| Prompt 版本管理 | `prompts/*.yaml` 为唯一源（多版本 + 激活版本 + A/B 权重），解析优先级：显式指定 > config overrides > A/B 加权抽样 > YAML `active`；每次 LLM 调用把 prompt 名/版本/内容 hash 写入监控库，支持调用链追溯与按版本统计调用量/成功率/成本 |
+| 全流程监控 | 独立 SQLite（`data/monitor.db`）记录 run/node span、延迟、token 用量与成本（按 config.yaml 价目折算），超预算/低成功率告警；旁路设计，写失败不反噬主流程 |
+| 自反馈优化 | 回答质量 LLM 自评（不合格重生成 ≤1 次）、识票字段 LLM 级自检、风控结论 LLM 复核（误报移除/漏报补充）；LLM 不可用时静默降级放行 |
+| 界面 | Streamlit：千问式多会话聊天（会话列表、标题取首问、侧边栏可收起）+ 流式输出 + 上传查验 + 确认报销入台账；会话历史持久化到 SQLite（`data/chat_history.db`），重启可恢复 |
 
 ## 快速开始
 
@@ -57,6 +60,10 @@ uv run python -m invoice_agent.cli recognize samples/01_normal_special.png  # �
 uv run python -m invoice_agent.cli run samples/04_wrong_taxid.png           # 完整链路
 uv run python -m invoice_agent.cli ask "餐饮发票能抵扣进项税吗"               # 纯政策问答
 uv run python -m invoice_agent.cli chat                                      # 多轮对话 REPL（/invoice <文件> 查票，/new 新会话）
+uv run python -m invoice_agent.cli prompts list                              # prompt 版本管理：列出全部 prompt 及激活版本
+uv run python -m invoice_agent.cli prompts show qa --version v2              # 查看 prompt 全文
+uv run python -m invoice_agent.cli prompts set-active qa v1                  # 切换激活版本（回写 YAML）
+uv run python -m invoice_agent.cli prompts usage                             # 按 prompt 名+版本统计调用量/成功率/成本
 ```
 
 ## 演示路径（用合成样本）
@@ -88,17 +95,20 @@ START → intake → [route_entry] ─┬→ recognize ⇄（失败重试 ≤2�
                                 │                      verify → dedup → risk
                                 └→ retrieve_docs ←──────────────────────┘
                                         ↓
-                                     finalize（qwen-max 汇总，含 [来源N] 引用）→ END
+                                     finalize（对话模型汇总，含 [来源N] 引用）→ END
 ```
 
-- **识票**：`qwen-vl-max` + `with_structured_output(InvoiceData)`，温度 0，缺失字段填 null 禁止编造
+- **识票**：视觉模型 `MODEL_VISION` + `with_structured_output(InvoiceData)`，温度 0，缺失字段填 null 禁止编造；字段级 LLM 自检可复用提取重试边（`feedback.field_check`）
 - **验真**：`InvoiceVerifyProvider` 抽象 + Mock 实现（注册表命中 → 确定性结果；未命中 → 哈希伪随机 85% PASS）。接入百望云/诺诺时新增 Provider 实现即可，图节点零改动
 - **去重**：SQLite 台账，"确认提交报销"后才写入，避免查询污染连号/拆分判断；`file_sha256` 区分同文件重传
-- **RAG**：按「第X条」切分保引用完整 → DashScope text-embedding-v3 + **PostgreSQL pgvector** 语义检索 → jieba+BM25 → RRF 融合 → 引用编号来自切分元数据（非模型生成）
-- **多轮记忆**：`MemorySaver` checkpointer 按 thread_id 持久化整个 AgentState（含 `chat_history`）；finalize 把历史转为消息注入 LLM；短问题/「那/为什么」开头的追问在检索时自动拼上上一问题补全语义
-- **上下文管理**（`services/context_manager.py`）：token 字符估算（CJK≈1/字、ASCII≈4字符/token）；历史超 `token_budget` 的 60% 触发压缩——最近 10 轮原样保留、更早内容由 qwen-max 做滚动摘要（工具调用只留工具名+结果）、摘要存入 `history_summary` 与 PG `memory_summaries`；最终 prompt 由 `fit_budget` 兜底截断保证不超上限
+- **RAG**：按「第X条」切分保引用完整 → `EMBEDDING_MODEL`（qwen3.7-text-embedding）+ **PostgreSQL pgvector** 语义检索 → jieba+BM25 → RRF 融合 → 引用编号来自切分元数据（非模型生成）；qa prompt v2 去模板化——直接自然作答，保留 [来源N] 引用与不足即拒答约束
+- **多轮记忆**：`MemorySaver` checkpointer 按 thread_id 持久化整个 AgentState（含 `chat_history`）；finalize 把历史转为消息注入 LLM；短问题/「那/为什么」开头的追问在检索时自动拼上上一问题补全语义；UI 多会话消息另存 SQLite `data/chat_history.db`（pydantic 模型带 `__type__` 标签序列化，重启恢复渲染）
+- **上下文管理**（`services/context_manager.py`）：token 字符估算（CJK≈1/字、ASCII≈4字符/token）；历史超 `token_budget` 的 60% 触发压缩——最近 10 轮原样保留、更早内容由对话模型做滚动摘要（工具调用只留工具名+结果）、摘要存入 `history_summary` 与 PG `memory_summaries`；最终 prompt 由 `fit_budget` 兜底截断保证不超上限
 - **长期记忆**（`services/memory_store.py`）：每轮问答 Q+A 合并嵌入存 PG `memory_chunks`（HNSW 索引），新问题向量召回 top-k 相关历史注入 prompt；PG 不可用时全部静默降级
-- **配置**：密钥在 `.env`（不入库），业务阈值/敏感词/上下文预算在 `config.yaml`
+- **Prompt 版本管理**（`prompts/registry.py` + `prompts/*.yaml`）：每个 prompt 一个 YAML（`versions`/`active`/`weight`）；解析优先级为显式 version 参数 > `config.yaml prompts.overrides` > A/B 加权抽样（`ab_enabled: true` 时按 weight 加权）> YAML 内 `active`。调用时经 contextvar 把 prompt 名/版本/hash（sha256 前 12 位）写入监控库 `llm_calls` 三列，全部版本快照旁路 upsert 到 monitor.db 供跨库追溯；YAML 缺失/损坏 fail-fast，快照写失败静默降级
+- **全流程监控**（`monitoring/`）：runs / node_spans / llm_calls 三张表记 run 状态、节点延迟与重试、token 用量与成本（按 `config.yaml monitoring.pricing` 每千 token 折算），节点/run 延迟超预算、单 run 重试过多、近 20 次成功率 < 90% 触发告警；全部写入吞异常只打 warning，绝不反噬主流程
+- **自反馈优化**（`feedback/critics.py`）：三个可注入 LLM 的 critic——回答质量自评（综合评分 < `pass_score` 时重生成，最多 `max_retries` 次）、识票字段自检、风控结论复核（误报移除/漏报补充，单次修订不回环）；LLM 为 None 或调用异常时静默降级放行
+- **配置**：密钥在 `.env`（不入库），业务阈值/敏感词/上下文预算/监控告警/prompt 版本策略在 `config.yaml`
 
 ## 已知限制与注意事项
 
@@ -108,8 +118,7 @@ START → intake → [route_entry] ─┬→ recognize ⇄（失败重试 ≤2�
 4. **token 上限为字符估算**（无 Qwen 本地 tokenizer），按保守口径设定（CJK≈1 token/字）；`context.token_budget` 可在 config.yaml 调整。
 5. **pgvector 链路需在有 PostgreSQL 的环境验收**：本仓库 CI 无 PG，`docker compose up -d` 后运行 `uv run pytest --override-ini addopts="-m integration"` 验证 RAG 检索与记忆召回。
 6. `samples/` 中的 PNG 已 gitignore；**真实发票严禁提交仓库**。
-4. **合成样本准确率偏高**：真实发票的盖章/折痕/拍照光斑会降低识别率，上线验收请用脱敏真实发票复测；必要时在 Phase 2 引入 PaddleOCR 交叉验证。
-5. `samples/` 中的 PNG 已 gitignore；**真实发票严禁提交仓库**。
+7. **合成样本准确率偏高**：真实发票的盖章/折痕/拍照光斑会降低识别率，上线验收请用脱敏真实发票复测；必要时在 Phase 2 引入 PaddleOCR 交叉验证。
 
 ## Phase 2 路线（未实现）
 
@@ -117,4 +126,5 @@ START → intake → [route_entry] ─┬→ recognize ⇄（失败重试 ≤2�
 - FastAPI 服务层（供 ERP/Java 系统调用）
 - 验真接入百望云/诺诺真实 API
 - 企业微信/钉钉/飞书机器人接入、批量异步处理
-- 跨进程持久化记忆（当前 MemorySaver 为进程内，重启即失；生产可换 SqliteSaver/PostgresSaver）
+- LangGraph checkpointer 跨进程持久化（当前 MemorySaver 为进程内；UI 会话消息已持久化到 `data/chat_history.db`，生产可进一步换 SqliteSaver/PostgresSaver）
+- Prompt A/B 评估看板（当前 `prompts usage` 已按版本统计调用量/成功率/成本，缺人工标注与对比报告）
