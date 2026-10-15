@@ -782,6 +782,10 @@ def main() -> None:
 
     with tab_chat:
         render_conversation_tab()
+        # 本轮实时气泡的落点：必须在输入条之前建好——run_turn 在输入条渲染之后
+        # 才被触发，若直接用 tab_chat，流式元素会追加到输入条的 DOM 之后，
+        # 显示在输入框下方，直到 st.rerun 才归位
+        live_slot = st.container()
         send_only, typed = render_input_bar()
     with tab_monitor:
         render_monitor_tab()
@@ -795,10 +799,10 @@ def main() -> None:
 
     if send_only:
         with tab_chat:
-            run_turn(cfg, tab_chat, payload, None)  # 仅发票：识票查验流程
+            run_turn(cfg, live_slot, payload, None)  # 仅发票：识票查验流程
     elif text:
         with tab_chat:
-            run_turn(cfg, tab_chat, payload, text)
+            run_turn(cfg, live_slot, payload, text)
 
 
 main()
