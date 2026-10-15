@@ -58,11 +58,13 @@ def _is_follow_up(question: str) -> bool:
 
 
 def retrieve_docs(state: AgentState) -> dict:
+    # 检索是增强项：索引未建（RuntimeError）或 embedding 网络故障均降级为空结果，不阻塞对话
     try:
         retriever = get_retriever()
-    except RuntimeError as exc:  # PG 不可用 / 索引未建
+        return {"rag_chunks": retriever.retrieve(_build_query(state))}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("政策检索失败（降级为无引用回答）：%s", exc)
         return {"rag_chunks": [], "extract_error": str(exc)}
-    return {"rag_chunks": retriever.retrieve(_build_query(state))}
 
 
 def _fallback_answer(state: AgentState) -> str:
@@ -174,10 +176,22 @@ def finalize(state: AgentState) -> dict:
     if critic_fb:
         context_parts.append(f"## 上一版回答的不足（请针对性改进，其余内容保持）\n{critic_fb}")
 
-    prompt_text = "\n\n".join(context_parts) + (
-        "\n\n请按以下结构输出 Markdown：发票概览 / 验真结论 / 重复性 / 风险提示 / 政策依据（[来源N] 引用列表）。"
-        '无发票时只回答政策问题。结合对话历史理解追问（如"那出租车票呢"指上一问题中的票据类型）。'
-    )
+    # 意图区分：有发票才输出查验类章节；纯政策问答直接自然作答，不做格式化模板
+    if invoice is not None:
+        output_rule = (
+            "请按以下结构输出 Markdown：发票概览 / 验真结论 / 重复性 / 风险提示 / "
+            "政策依据（[来源N] 引用列表）。"
+            '结合对话历史理解追问（如"那出租车票呢"指上一问题中的票据类型）。'
+        )
+    else:
+        output_rule = (
+            "本次未上传发票，属于纯政策问答：请直接、自然地回答用户问题本身，"
+            "不要套用任何固定章节模板，禁止输出发票概览 / 验真结论 / 重复性 / 风险提示"
+            "等发票查验类内容，也不要声明「未提供发票」；"
+            "政策结论按 system prompt 要求标注 [来源N] 引用。"
+            '结合对话历史理解追问（如"那出租车票呢"指上一问题中的票据类型）。'
+        )
+    prompt_text = "\n\n".join(context_parts) + "\n\n" + output_rule
     # 预算兜底：完整 prompt 超上限时从头截断
     prompt_text = fit_budget(prompt_text, cfg.context.token_budget)
 

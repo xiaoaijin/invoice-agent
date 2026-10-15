@@ -20,6 +20,7 @@ sys.path.insert(0, str(SRC_DIR))
 
 from invoice_agent.config import get_app_config
 from invoice_agent.monitoring.setup import setup_logging
+from invoice_agent.services.conversation_store import ConversationStore
 from invoice_agent.services.dedup_store import DedupStore
 
 setup_logging()
@@ -45,27 +46,59 @@ CSS = """
     /* 隐藏 Streamlit 原生 chrome */
     #MainMenu, footer {visibility: hidden;}
     header[data-testid="stHeader"] {display: none;}
-    .block-container {padding-top: 1.2rem; padding-bottom: 4rem; max-width: 1080px;}
-
-    /* 顶部横幅 */
-    .ia-hero {
-        display: flex; align-items: center; gap: 16px;
-        background: linear-gradient(120deg, #4f46e5 0%, #7c3aed 60%, #9333ea 100%);
-        border-radius: 16px; padding: 20px 28px; color: #fff; margin-bottom: 8px;
+    .block-container {
+        padding-top: 1.4rem; padding-bottom: 0; max-width: 1200px;
+        min-height: calc(100vh - 50px); display: flex; flex-direction: column;
     }
-    .ia-hero-icon {font-size: 40px; line-height: 1;}
-    .ia-hero-title {font-size: 24px; font-weight: 700; letter-spacing: .5px;}
-    .ia-hero-sub {font-size: 13px; opacity: .85; margin-top: 4px;}
+    [data-testid="stVerticalBlock"]:has(> [data-testid="stTabs"]) {flex: 1;}
+
+    /* 消息时间线：助手无头像全宽，用户右侧灰色气泡（千问式） */
+    [data-testid="stChatMessage"] {padding: .4rem 0;}
+    /* 头像容器为消息框首个子 div（无 testid），整体隐藏 */
+    [data-testid="stChatMessage"] > div:not([data-testid="stChatMessageContent"]):first-child {
+        display: none;
+    }
+    [data-testid="stChatMessage"] [data-testid="stChatMessageContent"] {
+        margin-left: 0; flex: 1 1 auto; width: 100%;
+    }
+    .ia-user-row {display: flex; justify-content: flex-end; padding: .35rem 0;}
+    .ia-user-bubble {
+        background: #f3f4f6; border-radius: 18px; padding: 10px 16px;
+        max-width: 76%; color: #1f2937; font-size: 15px; line-height: 1.6;
+        word-break: break-word; text-align: left;
+    }
+    .ia-user-bubble code {background: #e8eaef; border-radius: 6px; padding: 1px 6px;}
 
     /* 空状态欢迎卡 */
-    .ia-empty {text-align: center; padding: 36px 0 8px;}
+    .ia-empty {text-align: center; padding: 48px 0 8px;}
     .ia-empty-emoji {font-size: 52px;}
     .ia-empty-title {font-size: 22px; font-weight: 700; margin-top: 8px; color: #1e1b4b;}
     .ia-empty-sub {font-size: 14px; color: #6b7280; margin-top: 6px;}
 
-    /* 侧边栏 */
-    section[data-testid="stSidebar"] {background: #f8f9fe; border-right: 1px solid #e9eaf6;}
+    /* 侧边栏（千问式：浅色底、无框会话列表） */
+    section[data-testid="stSidebar"] {background: #fafafa; border-right: 1px solid #ececf1;}
     section[data-testid="stSidebar"] hr {margin: .6rem 0;}
+    section[data-testid="stSidebar"] .stButton > button {
+        border: none; box-shadow: none; background: transparent; color: #374151;
+        font-weight: 400; padding: 7px 12px; border-radius: 10px;
+        justify-content: flex-start; text-align: left;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    section[data-testid="stSidebar"] .stButton > button:hover {background: #f0f1f5;}
+    section[data-testid="stSidebar"] .stButton > button > p {
+        width: 100%; text-align: left;
+    }
+    /* 「新对话」：浅灰圆角大按钮 */
+    section[data-testid="stSidebar"] button[kind="primary"] {
+        background: #f1f2f6; border: 1px solid #e5e7eb; color: #111827;
+        font-weight: 600; justify-content: center; box-shadow: none;
+    }
+    section[data-testid="stSidebar"] button[kind="primary"]:hover {background: #e8eaef;}
+    /* 侧边栏底部用户 */
+    .ia-avatar {
+        width: 34px; height: 34px; background: #e5e7eb; border-radius: 50%;
+        display: flex; align-items: center; justify-content: center; font-size: 18px;
+    }
 
     /* 上传区：柔和虚线框 */
     [data-testid="stFileUploaderDropzone"] {
@@ -83,9 +116,47 @@ CSS = """
         border-radius: 12px; padding: 12px 14px;
     }
 
-    /* 气泡与状态容器 */
-    [data-testid="stChatMessage"] {padding: .5rem 0;}
+    /* 状态容器 */
     div[data-testid="stStatusWidget"] {border-radius: 12px;}
+
+    /* 对话 tab 底部输入区（千问式）：粘性置底，➕ 在输入框最左侧
+       sticky 必须挂在 stLayoutWrapper 上——sticky 元素只能在父盒子内移动，
+       输入条自己的父盒与它等高，挂上去无法滑动 */
+    [data-testid="stVerticalBlock"] > [data-testid="stLayoutWrapper"]:has(> .st-key-ia-input-bar) {
+        position: sticky; bottom: 0; z-index: 100; margin-top: auto;
+        background: #fff;
+    }
+    .st-key-ia-input-bar {
+        padding: 10px 2px 4px; margin-top: 12px;
+    }
+    .st-key-ia-input-bar [data-testid="stChatInput"] {
+        background: #fff; border: 1px solid #e5e7eb;
+        border-radius: 22px; box-shadow: 0 6px 24px rgba(17, 24, 39, .07);
+    }
+    .st-key-ia-input-bar [data-testid="stChatInput"] textarea {
+        font-size: 15px; padding-top: 12px;
+    }
+    .st-key-ia-input-bar [data-testid="stPopoverButton"],
+    .st-key-ia-input-bar [data-testid="stPopover"] > button {
+        border: none !important; box-shadow: none !important;
+        background: transparent !important; width: auto !important;
+        font-size: 22px; padding: 4px 6px;
+    }
+    /* 主内容区自身作为滚动容器，输入条的 sticky 才能钉在视口底部 */
+    section[data-testid="stMain"] {height: 100vh; max-height: 100vh; overflow-y: auto;}
+
+    /* 内容不足一屏时也把输入区压到视口底部（仅对话 tab 面板）。
+       注意不能改面板自身的 display——Streamlit 靠 emotion 类的 display:none 隐藏
+       非激活面板，高优先级规则会把它顶掉；直接给面板的子块设最小高度即可 */
+    [data-testid="stTabPanel"]:nth-child(2) > [data-testid="stVerticalBlock"] {
+        min-height: calc(100vh - 150px);
+    }
+    /* 免责声明（输入卡片下方居中小字） */
+    .st-key-ia-input-bar::after {
+        content: "内容由 AI 生成，请注意核实";
+        display: block; text-align: center; color: #9ca3af;
+        font-size: 12px; padding: 2px 0 4px;
+    }
 </style>
 """
 
@@ -97,28 +168,61 @@ def ensure_session() -> str:
     return st.session_state.thread_id
 
 
+def _conv_store() -> ConversationStore:
+    """对话历史库：与业务库同目录（data/chat_history.db），可随时删除。"""
+    return ConversationStore(Path(get_app_config().db_path).parent / "chat_history.db")
+
+
+def _conv_title(display: list[dict]) -> str:
+    """会话标题：取首条用户输入（千问式）。"""
+    for e in display:
+        if e["role"] == "user":
+            if e.get("text"):
+                return e["text"][:18]
+            if e.get("file_name"):
+                return f"发票查验：{e['file_name'][:14]}"
+    return "新对话"
+
+
+def save_conversation() -> None:
+    """当前对话落库（每轮结束调用，近期对话列表与消息恢复的数据源）。"""
+    display = st.session_state.get("display") or []
+    if not display:
+        return
+    _conv_store().save(st.session_state.thread_id, _conv_title(display), display)
+
+
 def run_graph(
     file_path: str | None,
     question: str | None,
     thread_id: str,
     progress_cb=None,
+    on_token=None,
 ) -> tuple[dict, object | None]:
-    """流式执行图：每完成一个节点回调 progress_cb，返回聚合的最终 state 与监控 handler。"""
+    """流式执行图：节点完成回调 progress_cb，finalize 的 LLM token 回调 on_token。
+
+    使用组合流模式：updates 驱动进度打勾，messages 捕获 finalize 节点的逐 token 输出。
+    """
     from invoice_agent.graph.builder import build_graph
     from invoice_agent.monitoring.setup import build_run_config
 
     config, handler = build_run_config(thread_id, run_type="invoice" if file_path else "ask")
     graph = build_graph()
     final: dict = {}
-    for update in graph.stream(
+    for mode, payload in graph.stream(
         {"session_id": thread_id, "file_path": file_path, "user_question": question},
         config=config,
-        stream_mode="updates",
+        stream_mode=["updates", "messages"],
     ):
-        for node, delta in update.items():
-            final.update(delta or {})
-            if progress_cb:
-                progress_cb(node, handler)
+        if mode == "updates":
+            for node, delta in payload.items():
+                final.update(delta or {})
+                if progress_cb:
+                    progress_cb(node, handler)
+        elif mode == "messages" and on_token:
+            chunk, meta = payload
+            if meta.get("langgraph_node") == "finalize" and chunk.content:
+                on_token(chunk.content)
     return final, handler
 
 
@@ -173,7 +277,58 @@ def render_invoice_card(invoice) -> None:
         st.warning(f"以下字段置信度较低，请人工核对：{low_conf}")
 
 
-def render_assistant_turn(idx: int, entry: dict) -> None:
+SUGGESTIONS = {
+    "invoice": ["这张发票能报销吗？", "有哪些合规风险需要注意？", "政策依据是什么？"],
+    "qa": ["能详细解释一下吗？", "能举个报销的例子吗？", "报销时需要哪些材料？"],
+}
+
+
+def render_user_message(fname: str | None, text: str | None) -> None:
+    """用户消息：右对齐浅灰圆角气泡（千问式），替代 chat_message 气泡。"""
+    import html as _html
+
+    rows = []
+    if fname:
+        rows.append(f"📎 <code>{_html.escape(fname)}</code>")
+    if text:
+        rows.append(_html.escape(text).replace("\n", "<br>"))
+    st.markdown(
+        f'<div class="ia-user-row"><div class="ia-user-bubble">{"".join(rows)}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _render_toolbar(idx: int, entry: dict, is_last: bool) -> None:
+    """回答下方操作栏（千问式）：复制 / 点赞 / 点踩 / 重新生成（仅最后一条）。"""
+    cols = st.columns([1, 0.6, 0.6, 1.4, 3])
+    if cols[0].button("📋 复制原文", key=f"copy_{idx}", use_container_width=True):
+        st.session_state[f"_show_copy_{idx}"] = True
+    fb = st.session_state.get(f"_fb_{idx}")
+    if cols[1].button("👍", key=f"up_{idx}", use_container_width=True,
+                      type="primary" if fb == 1 else "secondary"):
+        st.session_state[f"_fb_{idx}"] = 1
+        st.toast("感谢反馈！")
+    if cols[2].button("👎", key=f"down_{idx}", use_container_width=True,
+                      type="primary" if fb == -1 else "secondary"):
+        st.session_state[f"_fb_{idx}"] = -1
+        st.toast("感谢反馈，我们会持续改进。")
+    if is_last and cols[3].button("🔄 重新生成", key=f"regen_{idx}", use_container_width=True):
+        st.session_state["_regen_idx"] = idx
+        st.rerun()
+    if st.session_state.get(f"_show_copy_{idx}"):
+        st.code(entry.get("answer") or "（无文本回答）", language="markdown")
+
+
+def _render_followups(entry: dict) -> None:
+    """最新回答下方的追问建议 chips，点击直接发送。"""
+    cols = st.columns(3)
+    for col, s in zip(cols, SUGGESTIONS[entry.get("kind", "qa")]):
+        if col.button(s, key=f"fu_{s}", use_container_width=True):
+            st.session_state["queued_prompt"] = s
+            st.rerun()
+
+
+def render_assistant_turn(idx: int, entry: dict, is_last: bool = False) -> None:
     """渲染一条助手回复：发票查验结果卡片，或纯问答的回答。"""
     answer = entry.get("answer")
 
@@ -251,50 +406,7 @@ def render_assistant_turn(idx: int, entry: dict) -> None:
             entry["submitted"] = True
             st.rerun()
 
-
-def render_composer() -> None:
-    """统一输入区：上传发票（可选）+ 文字（可选），支持三种组合。"""
-    # 发送后清空输入框：须在下一次 text_area 实例化前消费
-    if st.session_state.pop("_clear_composer", False):
-        st.session_state.pop("composer_text", None)
-    # 示例问题按钮排队填充输入框
-    if prompt := st.session_state.pop("queued_prompt", None):
-        st.session_state["composer_text"] = prompt
-
-    pending = st.session_state.get("pending_file")
-    uploaded = st.file_uploader(
-        "上传发票（可选，图片或 PDF）", type=["png", "jpg", "jpeg", "pdf"], key="_uploader"
-    )
-    if pending and uploaded is None:
-        c1, c2 = st.columns([5, 1])
-        c1.info(f"📎 将使用示例发票：**{pending['name']}**")
-        if c2.button("移除", key="remove_pending"):
-            st.session_state.pop("pending_file", None)
-            st.rerun()
-
-    st.text_area(
-        "问题（可选）",
-        key="composer_text",
-        height=80,
-        placeholder="可只上传发票、只提问，或两者同时。例如：这张发票能报销吗？餐饮部分能抵扣吗？",
-    )
-
-    has_file = pending is not None or uploaded is not None
-    text = (st.session_state.get("composer_text") or "").strip()
-    if has_file and text:
-        mode = "🔎 识票查验 + 💬 政策解答"
-    elif has_file:
-        mode = "🔎 识票查验（识票 · 验真 · 查重 · 风控）"
-    elif text:
-        mode = "💬 政策问答"
-    else:
-        mode = "请上传发票或输入问题"
-
-    c_btn, c_mode = st.columns([1, 3])
-    send = c_btn.button("🚀 发送", type="primary", use_container_width=True,
-                        disabled=not (has_file or text))
-    c_mode.caption(f"将执行：{mode}")
-    st.session_state["_send"] = send
+    _render_toolbar(idx, entry, is_last)
 
 
 def render_empty_state() -> None:
@@ -323,87 +435,104 @@ def render_empty_state() -> None:
             st.rerun()
 
 
-def render_conversation_tab(cfg) -> None:
+def render_conversation_tab() -> None:
+    """对话时间线：用户/助手消息气泡（千问/豆包式，输入框固定在页面底部）。"""
     display: list[dict] = st.session_state.setdefault("display", [])
-
-    render_composer()
-
-    # 发送处理
-    if st.session_state.pop("_send", False):
-        pending = st.session_state.get("pending_file")
-        payload = None
-        if pending:
-            payload = (pending["bytes"], pending["name"])
-        elif (uploaded := st.session_state.get("_uploader")) is not None:
-            payload = (uploaded.getvalue(), uploaded.name)
-
-        text = (st.session_state.get("composer_text") or "").strip()
-        if payload is None and not text:
-            st.warning("请上传发票或输入问题")
-        else:
-            fpath = None
-            fname = None
-            if payload:
-                data, fname = payload
-                updir = Path(cfg.db_path).parent / "uploads"
-                updir.mkdir(parents=True, exist_ok=True)
-                fpath = updir / f"{uuid.uuid4().hex[:8]}_{fname}"
-                fpath.write_bytes(data)
-
-            display.append({"role": "user", "file_name": fname, "text": text or None})
-            thread_id = st.session_state.thread_id
-            with (
-                st.chat_message("assistant", avatar="🧾"),
-                st.status("处理中…", expanded=True) as status,
-            ):
-                state, handler = run_graph(
-                    str(fpath) if fpath else None,
-                    text or None,
-                    thread_id,
-                    progress_cb=_progress_writer,
-                )
-                done = sum(1 for e in handler.events if e["type"] == "node_end") if handler else 0
-                status.update(label=f"完成（{done} 个节点）", state="complete", expanded=False)
-
-            entry: dict = {
-                "role": "assistant",
-                "answer": state.get("answer"),
-                "rag_chunks": state.get("rag_chunks") or [],
-            }
-            if fpath:
-                entry.update(
-                    {
-                        "kind": "invoice",
-                        "invoice": state.get("invoice"),
-                        "verification": state.get("verification"),
-                        "dups": state.get("duplicate_hits") or [],
-                        "findings": state.get("risk_findings") or [],
-                        "file_path": str(fpath),
-                        "submitted": False,
-                    }
-                )
-            else:
-                entry["kind"] = "qa"
-            display.append(entry)
-
-            st.session_state["_clear_composer"] = True
-            st.session_state.pop("pending_file", None)
-            st.rerun()
-
-    # 时间线
     if not display:
         render_empty_state()
         return
-    for i, e in enumerate(display[-MAX_DISPLAY_HISTORY:]):
+    entries = display[-MAX_DISPLAY_HISTORY:]
+    last_assist = max((i for i, e in enumerate(entries) if e["role"] == "assistant"), default=None)
+    for i, e in enumerate(entries):
         if e["role"] == "user":
-            with st.chat_message("user", avatar="🧑‍💼"):
-                if e.get("file_name"):
-                    st.markdown(f"📎 上传了发票 `{e['file_name']}`")
-                if e.get("text"):
-                    st.markdown(e["text"])
+            render_user_message(e.get("file_name"), e.get("text"))
         else:
             with st.chat_message("assistant", avatar="🧾"):
-                render_assistant_turn(i, e)
+                render_assistant_turn(i, e, is_last=(i == last_assist))
+    if last_assist is not None:
+        _render_followups(entries[last_assist])
+
+
+def run_turn(
+    cfg, chat_slot, file_payload: tuple | None, text: str | None, append_user: bool = True
+) -> None:
+    """执行一轮对话：气泡内流式跑图，完成后写入 display 并刷新。
+
+    chat_slot 为对话 tab 的容器（可重复进入），实时过程渲染在其中，
+    与历史时间线保持同位。append_user=False 用于「重新生成」：用户气泡已在时间线中，
+    不重复追加。
+    """
+    display: list[dict] = st.session_state.setdefault("display", [])
+    fpath = None
+    fname = None
+    if file_payload:
+        data, fname = file_payload
+        updir = Path(cfg.db_path).parent / "uploads"
+        updir.mkdir(parents=True, exist_ok=True)
+        fpath = updir / f"{uuid.uuid4().hex[:8]}_{fname}"
+        fpath.write_bytes(data)
+
+    if append_user:
+        display.append({"role": "user", "file_name": fname, "text": text or None})
+    thread_id = st.session_state.thread_id
+
+    if append_user:
+        with chat_slot:
+            render_user_message(fname, text)
+
+    with chat_slot, st.chat_message("assistant", avatar="🧾"):
+        with st.status("处理中…", expanded=True) as status:
+            # 流式回答：首个 finalize token 到达时才建占位符（保证排在进度行下方）
+            streamed: list[str] = []
+            holder: dict = {}
+
+            def on_token(piece) -> None:
+                if isinstance(piece, list):  # 多模态 content 取文本片段
+                    piece = "".join(p.get("text", "") for p in piece if isinstance(p, dict))
+                if not piece:
+                    return
+                streamed.append(piece)
+                if "ph" not in holder:
+                    holder["ph"] = st.empty()
+                holder["ph"].markdown("".join(streamed))
+
+            state, handler = run_graph(
+                str(fpath) if fpath else None,
+                text or None,
+                thread_id,
+                progress_cb=_progress_writer,
+                on_token=on_token,
+            )
+            done = sum(1 for e in handler.events if e["type"] == "node_end") if handler else 0
+            status.update(label=f"完成（{done} 个节点）", state="complete", expanded=False)
+
+        entry: dict = {
+            "role": "assistant",
+            "answer": state.get("answer"),
+            "rag_chunks": state.get("rag_chunks") or [],
+        }
+        if fpath:
+            entry.update(
+                {
+                    "kind": "invoice",
+                    "invoice": state.get("invoice"),
+                    "verification": state.get("verification"),
+                    "dups": state.get("duplicate_hits") or [],
+                    "findings": state.get("risk_findings") or [],
+                    "file_path": str(fpath),
+                    "submitted": False,
+                }
+            )
+        else:
+            entry["kind"] = "qa"
+        render_assistant_turn(len(display), entry)
+
+    display.append(entry)
+    save_conversation()
+    st.session_state.pop("pending_file", None)
+    if fname:  # 上传的同名文件视为已消费，不再重复入队
+        st.session_state["_consumed_upload"] = fname
+    st.rerun()
 
 
 def render_monitor_tab() -> None:
@@ -557,52 +686,110 @@ def render_prompts_tab() -> None:
     )
 
 
+def render_input_bar() -> tuple[bool, str | None]:
+    """对话 tab 底部输入区：➕ 附件在输入框最左侧，同一行；待发送条在上方。
+
+    st.chat_input 在容器内为 inline 模式，随 tab 显示/隐藏；外层容器粘性置底。
+    返回 (send_only, typed)。
+    """
+    pending = st.session_state.get("pending_file")
+    send_only = False
+    with st.container(key="ia-input-bar"):
+        if pending:
+            c_chip, c_send, c_remove = st.columns([5, 1, 1])
+            c_chip.info(f"📎 待发送：**{pending['name']}**（可输入问题一起发出）")
+            send_only = c_send.button("🚀 发送", type="primary", key="send_pending",
+                                      use_container_width=True)
+            if c_remove.button("移除", key="remove_pending", use_container_width=True):
+                st.session_state.pop("pending_file", None)
+                st.session_state["_consumed_upload"] = pending["name"]
+                st.rerun()
+        c_plus, c_input = st.columns([1, 11], gap="small", vertical_alignment="center")
+        with c_plus.popover("➕"):
+            st.caption("上传发票（图片/PDF）或选择示例")
+            up = st.file_uploader("发票文件", type=["png", "jpg", "jpeg", "pdf"],
+                                  key="_uploader", label_visibility="collapsed")
+            # 上传后进入「待发送」，随下一条消息一起发出；发送过一次不再重复入队
+            if up is not None and up.name != st.session_state.get("_consumed_upload"):
+                st.session_state["pending_file"] = {"name": up.name, "bytes": up.getvalue()}
+            for p in sorted(SAMPLES_DIR.glob("*.png"))[:4]:
+                if st.button(p.name, key=f"sample_{p.name}", use_container_width=True):
+                    st.session_state["pending_file"] = {"name": p.name, "bytes": p.read_bytes()}
+                    st.rerun()
+        with c_input:
+            typed = st.chat_input("直接提问，也可以上传图片或文件…")
+    return send_only, typed
+
+
 def render_sidebar() -> None:
     with st.sidebar:
         st.markdown("## 🧾 发票助手")
-        st.caption("识票 · 验真 · 查重 · 风控 · 政策问答")
-        if st.button("🆕 新对话", use_container_width=True, type="primary"):
+        if st.button("＋ 新对话", use_container_width=True, type="primary"):
             st.session_state.thread_id = uuid.uuid4().hex
             st.session_state.display = []
             st.rerun()
 
-        st.divider()
-        st.caption("📚 示例发票（点击后直接发送即可查验）")
-        for p in sorted(SAMPLES_DIR.glob("*.png"))[:8]:
-            if st.button(p.name, key=f"sample_{p.name}", use_container_width=True):
-                st.session_state["pending_file"] = {"name": p.name, "bytes": p.read_bytes()}
-                st.rerun()
+        st.caption("🕘 近期对话")
+        current = st.session_state.thread_id
+        for conv in _conv_store().list_conversations(15):
+            marker = "●  " if conv["thread_id"] == current else ""
+            if st.button(f"{marker}{conv['title']}", key=f"conv_{conv['thread_id']}",
+                         use_container_width=True):
+                if conv["thread_id"] != current:
+                    st.session_state.thread_id = conv["thread_id"]
+                    st.session_state.display = _conv_store().get_entries(conv["thread_id"])
+                    st.rerun()
 
+        # 底部用户信息
         st.divider()
+        c_avatar, c_name = st.columns([1, 4])
+        c_avatar.markdown('<div class="ia-avatar">👤</div>', unsafe_allow_html=True)
+        c_name.markdown("**本地用户**")
         st.caption("⚠️ 验真当前为 Mock，未接真实查验平台")
 
 
 def main() -> None:
     st.markdown(CSS, unsafe_allow_html=True)
-    st.markdown(
-        """
-        <div class="ia-hero">
-            <div class="ia-hero-icon">🧾</div>
-            <div>
-                <div class="ia-hero-title">发票助手</div>
-                <div class="ia-hero-sub">识票 · 验真 · 查重 · 风控 · 政策问答 — 一次输入，全部搞定</div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
     ensure_session()
     cfg = get_app_config()
     render_sidebar()
 
     tab_chat, tab_monitor, tab_prompts = st.tabs(["💬 助手对话", "📈 监控面板", "📜 Prompt 版本"])
+
+    # 重新生成：须在时间线渲染前处理——本 run 只实时渲染新气泡，避免元素 key 重复；
+    # run_turn 结尾的 st.rerun 会跳过本次剩余渲染
+    display = st.session_state.setdefault("display", [])
+    regen_i = st.session_state.pop("_regen_idx", None)
+    if regen_i is not None and display:
+        base = len(display) - min(MAX_DISPLAY_HISTORY, len(display))
+        a_idx = base + regen_i
+        if 0 <= a_idx < len(display) and display[a_idx].get("role") == "assistant":
+            old = display.pop(a_idx)
+            fpath = old.get("file_path")
+            payload = (Path(fpath).read_bytes(), Path(fpath).name) if fpath and Path(fpath).exists() else None
+            text = next((e.get("text") for e in reversed(display[:a_idx]) if e["role"] == "user"), None)
+            with tab_chat:
+                run_turn(cfg, tab_chat, payload, text, append_user=False)
+
     with tab_chat:
-        render_conversation_tab(cfg)
+        render_conversation_tab()
+        send_only, typed = render_input_bar()
     with tab_monitor:
         render_monitor_tab()
     with tab_prompts:
         render_prompts_tab()
+
+    queued = st.session_state.pop("queued_prompt", None)
+    text = (typed or queued or "").strip()
+    pending_now = st.session_state.get("pending_file")
+    payload = (pending_now["bytes"], pending_now["name"]) if pending_now else None
+
+    if send_only:
+        with tab_chat:
+            run_turn(cfg, tab_chat, payload, None)  # 仅发票：识票查验流程
+    elif text:
+        with tab_chat:
+            run_turn(cfg, tab_chat, payload, text)
 
 
 main()

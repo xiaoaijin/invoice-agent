@@ -26,13 +26,21 @@ def get_vision_model() -> ChatOpenAI:
 
 @lru_cache
 def get_chat_model() -> ChatOpenAI:
-    """汇总回答/问答用对话模型。"""
+    """汇总回答/问答用对话模型。
+
+    流式输出（UI 逐 token 展示）+ 显式关闭思考模式（qwen3 系列默认开启会拖慢首字
+    到分钟级）+ 请求超时兜底，防止单次调用挂死整个 run。
+    """
     s = get_settings()
     return ChatOpenAI(
         model=s.model_chat,
         api_key=require_api_key(),
         base_url=s.llm_base_url,
         temperature=0.2,
+        streaming=True,
+        timeout=60.0,
+        max_retries=1,
+        extra_body={"enable_thinking": False},
     )
 
 
