@@ -53,6 +53,20 @@ CREATE TABLE IF NOT EXISTS memory_summaries (
     content TEXT NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- 自评教训库：critic 发现的问题跨运行持久化，供后续相似问题召回优化检索与回答
+-- kind：retrieval（检索教训，注入查询构造）| answer（回答教训，注入 finalize prompt）
+CREATE TABLE IF NOT EXISTS feedback_lessons (
+    id BIGSERIAL PRIMARY KEY,
+    kind TEXT NOT NULL DEFAULT 'answer',
+    question TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL,
+    embedding vector({EMBEDDING_DIM}) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_lessons_hnsw
+    ON feedback_lessons USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_lessons_kind ON feedback_lessons(kind);
 """
 
 

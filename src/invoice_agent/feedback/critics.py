@@ -36,6 +36,7 @@ class CritiqueResult(BaseModel):
     relevance: float = 1.0
     completeness: float = 1.0
     issues: list[str] = Field(default_factory=list)
+    retrieval_issues: list[str] = Field(default_factory=list)  # 检索条款不足的具体方向（检索回环用）
 
 
 class RiskReview(BaseModel):
@@ -138,6 +139,7 @@ def critique_answer(
         sufficiency * 0.4 + relevance * 0.3 + completeness * 0.3, 4
     )
     issues = [str(i) for i in (data.get("issues") or []) if str(i).strip()]
+    retrieval_issues = [str(i) for i in (data.get("retrieval_issues") or []) if str(i).strip()]
     return CritiqueResult(
         score=score,
         passed=score >= pass_score,
@@ -145,6 +147,7 @@ def critique_answer(
         relevance=relevance,
         completeness=completeness,
         issues=issues,
+        retrieval_issues=retrieval_issues,
     )
 
 
