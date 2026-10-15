@@ -88,12 +88,40 @@ class RiskReviewConfig(BaseModel):
     enabled: bool = True
 
 
+class LessonsConfig(BaseModel):
+    """自评教训持久化与召回（pgvector，PG 不可用自动降级）。"""
+
+    enabled: bool = True
+    recall_top_k: int = 3
+    min_score: float = 0.6  # 余弦相似度阈值（text-embedding-v3 相关问题约 0.55+）
+
+
+class IntentConfig(BaseModel):
+    """意图识别漏斗（关键词 → 正则 → LLM 兜底）。"""
+
+    enabled: bool = True  # 关闭时所有问题按 new_question 处理（不调 LLM）
+    llm_fallback: bool = True  # 关键词/正则均未定性时是否允许 LLM 兜底
+    chat_keywords: list[str] = Field(
+        default_factory=lambda: ["你好", "在吗", "谢谢", "辛苦", "再见", "你是谁", "嗨"]
+    )  # 寒暄/闲聊关键词（子串匹配）
+    domain_keywords: dict[str, list[str]] = Field(
+        default_factory=lambda: {
+            "policy": ["政策", "规定", "文件", "税法", "标准"],
+            "header": ["抬头", "税号", "开票信息", "开票名称"],
+            "deduction": ["抵扣", "进项", "税前扣除", "专票抵扣"],
+            "reimburse": ["报销", "贴票", "报销流程", "报销时效"],
+            "verify": ["查验", "验真", "真伪", "查验平台"],
+        }
+    )  # 业务领域关键词：命中最多的领域胜出，零成本打标
+
+
 class FeedbackConfig(BaseModel):
     """自反馈优化配置（各环路独立开关，LLM 失败自动降级）。"""
 
     answer: AnswerFeedbackConfig = Field(default_factory=AnswerFeedbackConfig)
     field_check: FieldCheckConfig = Field(default_factory=FieldCheckConfig)
     risk_review: RiskReviewConfig = Field(default_factory=RiskReviewConfig)
+    lessons: LessonsConfig = Field(default_factory=LessonsConfig)
 
 
 class MemoryConfig(BaseModel):
@@ -137,6 +165,7 @@ class AppConfig(BaseModel):
     context: ContextConfig = ContextConfig()
     memory: MemoryConfig = MemoryConfig()
     monitoring: MonitoringConfig = MonitoringConfig()
+    intent: IntentConfig = Field(default_factory=IntentConfig)
     feedback: FeedbackConfig = FeedbackConfig()
     prompts: PromptsConfig = PromptsConfig()
     upload: UploadConfig = Field(default_factory=UploadConfig)

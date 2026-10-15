@@ -2,10 +2,13 @@
 
 
 def route_entry(state) -> str:
-    """入口路由：有文件走识票；仅提问走纯 RAG。"""
+    """入口路由：有文件走识票；仅提问走纯 RAG（闲聊短路直接 finalize）。"""
     if state.get("page_images") or state.get("file_path"):
-        return "recognize"
+        return "recognize"  # 有发票仍走识票全流程；意图只影响检索 query 组装
     if state.get("user_question"):
+        # 闲聊：跳过检索直接作答（state 无 intent 字段视为新问题，兼容旧 checkpointer 线程）
+        if (state.get("intent") or {}).get("retrieval_type") == "chat":
+            return "finalize"
         return "retrieve_docs"
     return "finalize"
 

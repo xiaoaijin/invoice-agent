@@ -27,6 +27,9 @@ class AgentState(TypedDict, total=False):
     duplicate_hits: list[DuplicateHit]
     risk_findings: list[Finding]
 
+    # 意图识别（intake 后、路由前执行；关键词/正则零成本，LLM 仅兜底）
+    intent: dict | None  # IntentResult.model_dump()：retrieval_type / domain / source
+
     # RAG
     rag_chunks: list[RetrievedChunk]
 

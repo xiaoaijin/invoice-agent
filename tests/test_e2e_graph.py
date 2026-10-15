@@ -31,8 +31,8 @@ def make_invoice(**kw) -> InvoiceData:
 
 @pytest.fixture(autouse=True)
 def _skip_critics(monkeypatch):
-    """自反馈节点会调 LLM，e2e 流转测试统一短路（critic 自身逻辑见 test_critics.py）。"""
-    from invoice_agent.graph.nodes import critic
+    """自反馈/意图兜底节点会调 LLM，e2e 流转测试统一短路（各自逻辑见专测文件）。"""
+    from invoice_agent.graph.nodes import critic, intent
 
     monkeypatch.setattr(
         critic,
@@ -40,6 +40,7 @@ def _skip_critics(monkeypatch):
         lambda state: {"critique": {"passed": True}, "critic_feedback": None},
     )
     monkeypatch.setattr(critic, "risk_review", lambda state: {})
+    monkeypatch.setattr(intent, "default_llm_fn", lambda: None)
 
 
 def _patch_config(monkeypatch, tmp_path: Path) -> None:
@@ -54,9 +55,9 @@ def _patch_config(monkeypatch, tmp_path: Path) -> None:
             knowledge_dir=str(tmp_path / "knowledge"),
         ),
     )
-    from invoice_agent.graph.nodes import dedup, risk, verify
+    from invoice_agent.graph.nodes import dedup, intent, risk, verify
 
-    for mod in (dedup, risk, verify):
+    for mod in (dedup, intent, risk, verify):
         monkeypatch.setattr(mod, "get_app_config", lambda: fake_cfg)
 
 
@@ -183,6 +184,29 @@ class TestGraphFlow:
         )
         assert state["answer"] == "RAG-ONLY"
         assert state.get("invoice") is None
+
+    def test_chat_short_circuits_retrieval(self, tmp_path, monkeypatch):
+        """无文件闲聊 → 意图判 chat → 跳过检索直接 finalize。"""
+        import invoice_agent.graph.nodes.answer as answer_mod
+        from invoice_agent.graph import nodes
+
+        retrieve_calls = {"n": 0}
+
+        def retrieve_docs(state):
+            retrieve_calls["n"] += 1
+            return {"rag_chunks": []}
+
+        monkeypatch.setattr(answer_mod, "retrieve_docs", retrieve_docs)
+        monkeypatch.setattr(nodes.answer, "finalize", lambda state: {"answer": "你好，我是报销助手"})
+
+        g = _fresh_graph()
+        state = g.invoke(
+            {"session_id": "t5", "file_path": None, "user_question": "你好"},
+            config={"configurable": {"thread_id": "t5"}},
+        )
+        assert retrieve_calls["n"] == 0  # 闲聊短路，检索节点未执行
+        assert state["answer"] == "你好，我是报销助手"
+        assert state["intent"]["retrieval_type"] == "chat"
 
 
 class TestCheckExtract:

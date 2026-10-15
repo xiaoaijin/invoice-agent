@@ -81,6 +81,20 @@ class TestCritiqueAnswer:
         r = critique_answer("回答", _state(), None, pass_score=0.7)
         assert r.passed
 
+    def test_retrieval_issues_parsed(self):
+        payload = (
+            '{"sufficiency": 0.5, "relevance": 0.6, "completeness": 0.5, "score": 0.5, '
+            '"issues": ["引用条款不足"], "retrieval_issues": ["缺少餐饮发票进项抵扣条款"]}'
+        )
+        r = critique_answer("回答", _state(), self._llm_returning(payload), pass_score=0.7)
+        assert r.retrieval_issues == ["缺少餐饮发票进项抵扣条款"]
+
+    def test_legacy_payload_without_retrieval_issues(self):
+        """旧版（v1）输出无 retrieval_issues 键 → 默认空列表，向后兼容。"""
+        payload = '{"sufficiency": 0.9, "relevance": 0.9, "completeness": 0.9, "score": 0.9, "issues": []}'
+        r = critique_answer("回答", _state(), self._llm_returning(payload), pass_score=0.7)
+        assert r.retrieval_issues == []
+
 
 # ---- ② field_self_check ----
 
@@ -168,8 +182,11 @@ class TestReviewRisk:
 # ---- 图级：自评回环 ----
 
 
-def _build_graph_with(monkeypatch, tmp_path: Path, finalize_fn, critique_fn):
-    """构建图并替换外部依赖（仿 test_e2e_graph 模式）。"""
+def _build_graph_with(monkeypatch, tmp_path: Path, finalize_fn, critique_fn, retrieve_fn=None):
+    """构建图并替换外部依赖（仿 test_e2e_graph 模式）。
+
+    retrieve_fn 传 None 用默认空桩；检索回环用例传计数桩以观察重检。
+    """
     import invoice_agent.graph.nodes.answer as answer_mod
     from invoice_agent.graph.nodes import critic, intake, recognize
 
@@ -191,7 +208,7 @@ def _build_graph_with(monkeypatch, tmp_path: Path, finalize_fn, critique_fn):
         "recognize",
         lambda state: {"invoice": make_invoice(), "extract_error": None, "recognize_retry": 0},
     )
-    monkeypatch.setattr(answer_mod, "retrieve_docs", lambda state: {"rag_chunks": []})
+    monkeypatch.setattr(answer_mod, "retrieve_docs", retrieve_fn or (lambda state: {"rag_chunks": []}))
     monkeypatch.setattr(answer_mod, "finalize", finalize_fn)
     monkeypatch.setattr(critic, "critic_answer", critique_fn)
 
@@ -297,3 +314,101 @@ class TestCritiqueLoop:
             config={"configurable": {"thread_id": "c3"}},
         )
         assert [f.rule_id for f in seen["findings"]] == ["LLM-REVIEW"]
+
+
+# ---- 路由：route_after_critique 纯函数 ----
+
+
+class TestRouteAfterCritique:
+    def test_passed_ends(self):
+        from invoice_agent.graph.nodes.route import route_after_critique
+
+        assert route_after_critique({"critique": {"passed": True}}) == "END"
+        assert route_after_critique({}) == "END"  # 无 critique 默认放行
+
+    def test_plain_failure_routes_to_finalize(self):
+        from invoice_agent.graph.nodes.route import route_after_critique
+
+        assert route_after_critique({"critique": {"passed": False}}) == "finalize"
+
+
+# ---- 图级：真 critic_answer 验证重检回环已移除（打桩 critique_answer 纯函数）----
+
+
+def _build_real_critic_graph(monkeypatch, tmp_path: Path, critique_results: list):
+    """用真实 critic_answer 节点验证检索回环：只打桩 critique_answer 纯函数与教训写入。
+
+    critique_results 按调用次序弹出；用尽后重复最后一个。
+    """
+    import invoice_agent.graph.nodes.answer as answer_mod
+    from invoice_agent.feedback.critics import CritiqueResult
+    from invoice_agent.graph.nodes import critic, intake, recognize
+
+    fake_cfg = AppConfig(
+        company=CompanyConfig(name="示例科技有限公司", tax_id="91330100MA27XXXXXX"),
+        risk=RiskConfig(),
+        feedback=FeedbackConfig(answer=AnswerFeedbackConfig(max_retries=1, pass_score=0.7)),
+        paths=PathsConfig(db=str(tmp_path / "g.db"), knowledge_dir=str(tmp_path / "k")),
+    )
+    from invoice_agent.graph.nodes import dedup, risk, verify
+
+    for mod in (dedup, risk, verify):
+        monkeypatch.setattr(mod, "get_app_config", lambda: fake_cfg)
+    monkeypatch.setattr(critic, "get_app_config", lambda: fake_cfg)
+
+    monkeypatch.setattr(intake, "intake", lambda state: {"page_images": ["x"]})
+    monkeypatch.setattr(
+        recognize,
+        "recognize",
+        lambda state: {"invoice": make_invoice(), "extract_error": None, "recognize_retry": 0},
+    )
+    monkeypatch.setattr(critic, "risk_review", lambda state: {})
+    monkeypatch.setattr(critic, "_record_lessons", lambda state, result: None)
+
+    seq = {"i": 0}
+
+    def fake_critique(answer, state, llm_fn, pass_score):
+        r = critique_results[min(seq["i"], len(critique_results) - 1)]
+        seq["i"] += 1
+        return r
+
+    monkeypatch.setattr(critic, "critique_answer", fake_critique)
+    monkeypatch.setattr(critic, "default_llm_fn", lambda: None)
+
+    retrieve_calls: list[dict] = []
+
+    def retrieve_docs(state):
+        retrieve_calls.append({"question": state.get("user_question")})
+        return {"rag_chunks": []}
+
+    monkeypatch.setattr(answer_mod, "retrieve_docs", retrieve_docs)
+
+    finalize_calls = {"n": 0}
+
+    def finalize(state):
+        finalize_calls["n"] += 1
+        return {"answer": f"v{finalize_calls['n']}"}
+
+    monkeypatch.setattr(answer_mod, "finalize", finalize)
+
+    builder_mod.build_graph.cache_clear()
+    graph = builder_mod.build_graph()
+    return graph, retrieve_calls, finalize_calls
+
+
+class TestRetrievalLoopRemoved:
+    def test_retrieval_issues_no_longer_loop_back(self, tmp_path, monkeypatch):
+        """重检回环已移除：retrieval_issues 只落教训库，不再触发 retrieve_docs 重检。"""
+        fail = CritiqueResult(
+            score=0.5, passed=False, issues=["引用不足"], retrieval_issues=["缺少抵扣条款"]
+        )
+        g, retrieve_calls, finalize_calls = _build_real_critic_graph(
+            monkeypatch, tmp_path, [fail, CritiqueResult(score=0.9, passed=True)]
+        )
+        state = g.invoke(
+            {"session_id": "r1", "file_path": "x.png", "user_question": "能报销吗"},
+            config={"configurable": {"thread_id": "r1"}},
+        )
+        assert len(retrieve_calls) == 1  # 仅首检，无重检回环
+        assert finalize_calls["n"] == 2  # 失败 → finalize 重生成一次 → 二次自评通过
+        assert state["critique"]["passed"] is True

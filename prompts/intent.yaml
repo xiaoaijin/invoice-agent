@@ -1,0 +1,18 @@
+name: intent
+description: 意图识别 LLM 兜底（关键词/正则均未定性时调用），输出结构化 JSON
+active: v1
+versions:
+  - version: v1
+    weight: 1
+    description: 初版：两层输出（检索类型 + 业务领域）
+    text: |-
+      你是问答系统的意图分类器。根据最近的对话历史和用户当前问题，判断意图并以 JSON 输出：
+      {"retrieval_type": "...", "domain": "..."}
+      retrieval_type 取值：
+      - "new_question"：独立的新问题，不依赖上文；
+      - "follow_up"：追问或指代上文（如"那出租车票呢"中的"那"指上一问题中的票据类型），
+        需要结合对话历史消解指代；
+      - "chat"：寒暄、闲聊、感谢等，无需知识库检索。
+      domain 取值（闲聊填 "chat"）："policy"（政策问答）/"header"（发票抬头）/"deduction"（抵扣）/
+      "reimburse"（报销流程）/"verify"（发票查验）。
+      只输出 JSON，不要解释。

@@ -16,6 +16,7 @@
 | Prompt 版本管理 | `prompts/*.yaml` 为唯一源（多版本 + 激活版本 + A/B 权重），解析优先级：显式指定 > config overrides > A/B 加权抽样 > YAML `active`；每次 LLM 调用把 prompt 名/版本/内容 hash 写入监控库，支持调用链追溯与按版本统计调用量/成功率/成本 |
 | 全流程监控 | 独立 SQLite（`data/monitor.db`）记录 run/node span、延迟、token 用量与成本（按 config.yaml 价目折算），超预算/低成功率告警；旁路设计，写失败不反噬主流程 |
 | 自反馈优化 | 回答质量 LLM 自评（不合格重生成 ≤1 次）、识票字段 LLM 级自检、风控结论 LLM 复核（误报移除/漏报补充）；LLM 不可用时静默降级放行 |
+| 意图识别漏斗 | 关键词 → 追问正则 → LLM 兜底三层分类（检索类型 + 业务领域），追问触发 LLM 查询改写、闲聊短路跳过检索 |
 | 界面 | Streamlit：千问式多会话聊天（会话列表、标题取首问、侧边栏可收起）+ 流式输出 + 上传查验 + 确认报销入台账；会话历史持久化到 SQLite（`data/chat_history.db`），重启可恢复 |
 
 ## 快速开始
@@ -111,12 +112,14 @@ uv run pytest --override-ini addopts="-m integration"   # 集成测试（需 API
 
 ```
 LangGraph 状态图：
-START → intake → [route_entry] ─┬→ recognize ⇄（失败重试 ≤2）→ [check_extract]
-                                │                                  ↓ 通过
-                                │                      verify → dedup → risk
-                                └→ retrieve_docs ←──────────────────────┘
-                                        ↓
-                                     finalize（对话模型汇总，含 [来源N] 引用）→ END
+START → intake → [intent 意图漏斗] → [route_entry] ─┬→ recognize ⇄（失败重试 ≤2）→ [check_extract]
+                                                    │                                  ↓ 通过
+                                                    │                      verify → dedup → risk
+                                                    └→ retrieve_docs（追问时 LLM 改写查询消解指代）←──┘
+                                                            ↓
+                                                         finalize（对话模型汇总，含 [来源N] 引用）
+                                                            ↑  ⇄ 自评不通过带反馈重生成（≤max_retries）→ END
+（闲聊意图短路：仅提问且意图为 chat 时直接 finalize，跳过检索）
 ```
 
 - **识票**：视觉模型 `MODEL_VISION` + `with_structured_output(InvoiceData)`，温度 0，缺失字段填 null 禁止编造；字段级 LLM 自检可复用提取重试边（`feedback.field_check`）
@@ -128,7 +131,9 @@ START → intake → [route_entry] ─┬→ recognize ⇄（失败重试 ≤2�
 - **长期记忆**（`services/memory_store.py`）：每轮问答 Q+A 合并嵌入存 PG `memory_chunks`（HNSW 索引），新问题向量召回 top-k 相关历史注入 prompt；PG 不可用时全部静默降级
 - **Prompt 版本管理**（`prompts/registry.py` + `prompts/*.yaml`）：每个 prompt 一个 YAML（`versions`/`active`/`weight`）；解析优先级为显式 version 参数 > `config.yaml prompts.overrides` > A/B 加权抽样（`ab_enabled: true` 时按 weight 加权）> YAML 内 `active`。调用时经 contextvar 把 prompt 名/版本/hash（sha256 前 12 位）写入监控库 `llm_calls` 三列，全部版本快照旁路 upsert 到 monitor.db 供跨库追溯；YAML 缺失/损坏 fail-fast，快照写失败静默降级
 - **全流程监控**（`monitoring/`）：runs / node_spans / llm_calls 三张表记 run 状态、节点延迟与重试、token 用量与成本（按 `config.yaml monitoring.pricing` 每千 token 折算），节点/run 延迟超预算、单 run 重试过多、近 20 次成功率 < 90% 触发告警；全部写入吞异常只打 warning，绝不反噬主流程
-- **自反馈优化**（`feedback/critics.py`）：三个可注入 LLM 的 critic——回答质量自评（综合评分 < `pass_score` 时重生成，最多 `max_retries` 次）、识票字段自检、风控结论复核（误报移除/漏报补充，单次修订不回环）；LLM 为 None 或调用异常时静默降级放行
+- **意图识别漏斗**（`graph/nodes/intent.py`）：关键词匹配 → 追问正则 → LLM 兜底（前几层零成本同步，仅都未定性时调 LLM），输出两层意图——检索类型（新问题/追问/闲聊）+ 业务领域（政策/抬头/抵扣/报销/查验）；追问触发 `query_rewrite` LLM 改写查询（前置到首次检索，失败降级原查询），闲聊短路跳过检索；关键词表在 `config.yaml intent` 节可运营调整
+- **自反馈优化**（`feedback/critics.py`）：三个可注入 LLM 的 critic——回答质量自评（综合评分 < `pass_score` 时带反馈重生成 ≤ `max_retries` 次）、识票字段自检、风控结论复核（误报移除/漏报补充，单次修订不回环）；LLM 为 None 或调用异常时静默降级放行
+- **自评教训库**（`services/lesson_store.py`）：自评发现的问题按 kind（retrieval/answer）跨运行持久化到 PG `feedback_lessons`（pgvector + HNSW），后续运行遇到相似问题时语义召回——检索教训注入查询构造、回答教训在 finalize prompt 注入「历史改进提示」；同 kind+question+content 去重，PG 不可用静默降级（`feedback.lessons` 可整体关闭）
 - **配置**：密钥在 `.env`（不入库），业务阈值/敏感词/上下文预算/监控告警/prompt 版本策略在 `config.yaml`
 
 ## 已知限制与注意事项

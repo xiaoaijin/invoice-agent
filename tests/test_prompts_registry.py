@@ -271,3 +271,23 @@ class TestUse:
         with pytest.raises(RuntimeError), use("qa"):
             raise RuntimeError("x")
         assert current_prompt() is None
+
+
+class TestRealPromptsDir:
+    def test_real_prompts_load(self):
+        """真实 prompts 目录可加载：critique v2 / query_rewrite v2 / intent 均存在且 active 可解析。
+
+        防 name 与文件名 stem 不一致 / active 指向缺失版本（registry fail-fast 全局生效）。
+        """
+        from invoice_agent.config import get_app_config
+
+        registry = PromptRegistry(get_app_config().prompts_dir, snapshot=False)
+        critique = registry.get("critique")
+        assert critique.version == "v2"
+        assert "retrieval_issues" in critique.text
+        rewrite = registry.get("query_rewrite")
+        assert rewrite.name == "query_rewrite"
+        assert rewrite.version == "v2"
+        intent_prompt = registry.get("intent")
+        assert intent_prompt.name == "intent"
+        assert "retrieval_type" in intent_prompt.text

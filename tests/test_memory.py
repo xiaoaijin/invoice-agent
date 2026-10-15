@@ -32,7 +32,7 @@ def make_invoice(**kw) -> InvoiceData:
 def _patch_env(monkeypatch, tmp_path: Path, llm_answer: str = "OK") -> None:
     """打桩：临时 SQLite + finalize 不调 LLM 但走真实记忆逻辑。"""
     from invoice_agent.config import AppConfig, CompanyConfig, PathsConfig, RiskConfig
-    from invoice_agent.graph.nodes import dedup, risk, verify
+    from invoice_agent.graph.nodes import dedup, intent, risk, verify
 
     fake_cfg = AppConfig(
         company=CompanyConfig(name="示例科技有限公司", tax_id="91330100MA27XXXXXX"),
@@ -42,8 +42,10 @@ def _patch_env(monkeypatch, tmp_path: Path, llm_answer: str = "OK") -> None:
             knowledge_dir=str(tmp_path / "knowledge"),
         ),
     )
-    for mod in (dedup, risk, verify):
+    for mod in (dedup, intent, risk, verify):
         monkeypatch.setattr(mod, "get_app_config", lambda: fake_cfg)
+    # 意图 LLM 兜底禁用：多轮追问句式已由正则/规则层覆盖，不应触达真实 LLM
+    monkeypatch.setattr(intent, "default_llm_fn", lambda: None)
     monkeypatch.setattr(answer_mod, "retrieve_docs", lambda state: {"rag_chunks": []})
 
     def fake_finalize(state):
@@ -128,6 +130,26 @@ class TestMemory:
         q = answer_mod._build_query(state)
         assert "增值税专用发票" in q
         assert "能报销吗" in q
+
+    def test_intent_follow_up_overrides_heuristic(self):
+        """意图字段存在时优先于启发式：follow_up → 拼上一轮。"""
+        state = {
+            "intent": {"retrieval_type": "follow_up", "domain": "deduction", "source": "llm"},
+            "chat_history": [{"role": "user", "content": "餐饮发票能抵扣吗"}],
+            "user_question": "出租车票呢",
+        }
+        q = answer_mod._build_query(state)
+        assert "餐饮发票能抵扣吗" in q
+
+    def test_intent_new_question_overrides_short_heuristic(self):
+        """意图判定新问题（即使短问题，启发式本会判追问）→ 不拼上一轮。"""
+        state = {
+            "intent": {"retrieval_type": "new_question", "domain": "policy", "source": "llm"},
+            "chat_history": [{"role": "user", "content": "餐饮发票能抵扣吗"}],
+            "user_question": "货车通行费呢",
+        }
+        q = answer_mod._build_query(state)
+        assert "餐饮发票能抵扣吗" not in q
 
     def test_history_messages_format(self):
         history = [

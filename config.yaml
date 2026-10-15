@@ -37,6 +37,24 @@ memory:
   enabled: true               # PG 不可用时自动降级为无长期记忆
   recall_top_k: 5             # 语义召回相关历史记忆条数
 
+intent:
+  enabled: true               # 意图识别漏斗总开关（关闭时所有问题按新问题处理，不调 LLM）
+  llm_fallback: true          # 关键词/正则均未定性时是否允许 LLM 兜底
+  chat_keywords:              # 寒暄/闲聊关键词（子串匹配，命中即跳过检索）
+    - "你好"
+    - "在吗"
+    - "谢谢"
+    - "辛苦"
+    - "再见"
+    - "你是谁"
+    - "嗨"
+  domain_keywords:            # 业务领域打标（零成本，命中最多的领域胜出）
+    policy: ["政策", "规定", "文件", "税法", "标准"]
+    header: ["抬头", "税号", "开票信息", "开票名称"]
+    deduction: ["抵扣", "进项", "税前扣除", "专票抵扣"]
+    reimburse: ["报销", "贴票", "报销流程", "报销时效"]
+    verify: ["查验", "验真", "真伪", "查验平台"]
+
 monitoring:
   enabled: true               # 全流程监控总开关
   db: "data/monitor.db"       # 监控 trace 独立 SQLite（与去重库分离，可随时删除）
@@ -51,7 +69,8 @@ monitoring:
       default: 10000
       recognize: 25000
       finalize: 15000
-      retrieve_docs: 3000
+      retrieve_docs: 10000     # 首检轮含追问场景的 LLM 查询改写调用，预算需覆盖之
+      intent: 3000             # 意图识别（关键词/正则层微秒级，预算覆盖 LLM 兜底轮）
     run_latency_budget_ms: 60000
     max_retries_per_run: 2    # 单次 run 内同节点重复执行超此数告警
     success_rate_window: 20   # 近 N 次 run 的成功率窗口
@@ -66,6 +85,10 @@ feedback:
     enabled: true             # 识票字段 LLM 级自检（复用提取重试边）
   risk_review:
     enabled: true             # 风控结论 LLM 复核（误报移除/漏报补充，单次修订不回环）
+  lessons:                    # 自评教训持久化（pgvector），供后续运行召回优化
+    enabled: true
+    recall_top_k: 3           # 相似问题召回的教训条数
+    min_score: 0.6            # 余弦相似度阈值，低于此不注入
 
 prompts:
   dir: "prompts"              # prompt YAML 目录（相对项目根）

@@ -22,6 +22,7 @@ from invoice_agent.services.context_manager import (
     estimate_tokens,
     fit_budget,
 )
+from invoice_agent.services.lesson_store import get_lesson_store
 from invoice_agent.services.llm import get_chat_model
 from invoice_agent.services.rag.qa import format_chunks_for_prompt
 from invoice_agent.services.rag.retriever import get_retriever
@@ -41,12 +42,29 @@ def _build_query(state: AgentState) -> str:
             if entry.get("role") == "user":
                 prev = entry.get("content")
                 break
-        if prev and prev != question and _is_follow_up(question):
+        # 追问判定：优先用意图漏斗结果；state 无意图字段（直测/旧线程）时退回启发式
+        if state.get("intent") is not None:
+            is_follow_up = (state["intent"] or {}).get("retrieval_type") == "follow_up"
+        else:
+            is_follow_up = _is_follow_up(question)
+        if prev and prev != question and is_follow_up:
             parts.append(f"用户上一问题：{prev}")
         parts.append(f"用户问题：{question}")
     if not parts:
         parts.append("发票报销相关规定")
-    return "；".join(parts)
+    query = "；".join(parts)
+    # 历史教训召回：相似问题曾因检索不足被自评点名，本次检索提前补相关方向
+    if question:
+        try:
+            lcfg = get_app_config().feedback.lessons
+            lessons = get_lesson_store().recall(
+                question, kind="retrieval", top_k=lcfg.recall_top_k, min_score=lcfg.min_score
+            )
+            if lessons:
+                query += "；注意补充检索：" + "；".join(l["content"][:60] for l in lessons)
+        except Exception as exc:  # noqa: BLE001 — 教训是增强项，失败不影响检索
+            logger.warning("检索教训召回失败（忽略）：%s", exc)
+    return query
 
 
 def _is_follow_up(question: str) -> bool:
@@ -57,11 +75,44 @@ def _is_follow_up(question: str) -> bool:
     )
 
 
+def _rewrite_query(query: str, state: AgentState) -> str:
+    """追问时用 LLM 结合对话历史改写查询、消解指代；LLM 不可用/失败降级为原查询。
+
+    改写已前置到首次检索（意图驱动触发）。降级时原查询本身已含上一轮问题拼接，
+    消解能力不打折，仅少了 LLM 精炼。
+    """
+    try:
+        with use("query_rewrite") as prompt:
+            recent = "\n".join(
+                f"{'用户' if e.get('role') == 'user' else '助手'}：{e.get('content', '')}"
+                for e in (state.get("chat_history") or [])[-4:]  # 最近 2 轮
+            )
+            domain = (state.get("intent") or {}).get("domain", "")
+            user_content = (
+                f"## 最近对话\n{recent or '（无）'}\n\n"
+                f"## 业务领域\n{domain or '（未知）'}\n\n"
+                f"## 待改写的检索查询\n{query}"
+            )
+            messages = [
+                SystemMessage(content=prompt.text),
+                HumanMessage(content=user_content),
+            ]
+            rewritten = get_chat_model().invoke(messages).content.strip()
+            return rewritten or query
+    except Exception as exc:  # noqa: BLE001 — 含 PromptNotFoundError（fail-fast prompt 缺失不阻塞检索）
+        logger.warning("查询改写失败（降级为原查询）：%s", exc)
+        return query
+
+
 def retrieve_docs(state: AgentState) -> dict:
     # 检索是增强项：索引未建（RuntimeError）或 embedding 网络故障均降级为空结果，不阻塞对话
     try:
         retriever = get_retriever()
-        return {"rag_chunks": retriever.retrieve(_build_query(state))}
+        query = _build_query(state)
+        # 意图驱动改写：仅追问触发 LLM 消解指代；新问题直接用拼接 query
+        if (state.get("intent") or {}).get("retrieval_type") == "follow_up":
+            query = _rewrite_query(query, state)
+        return {"rag_chunks": retriever.retrieve(query)}
     except Exception as exc:  # noqa: BLE001
         logger.warning("政策检索失败（降级为无引用回答）：%s", exc)
         return {"rag_chunks": [], "extract_error": str(exc)}
@@ -175,6 +226,23 @@ def finalize(state: AgentState) -> dict:
     critic_fb = state.get("critic_feedback")
     if critic_fb:
         context_parts.append(f"## 上一版回答的不足（请针对性改进，其余内容保持）\n{critic_fb}")
+    # 历史教训：过往相似问题自评发现的答案类不足，提前规避（当轮已有 critic_feedback 时跳过，避免重复）
+    elif state.get("user_question"):
+        try:
+            lcfg = cfg.feedback.lessons
+            lessons = get_lesson_store().recall(
+                state["user_question"],
+                kind="answer",
+                top_k=lcfg.recall_top_k,
+                min_score=lcfg.min_score,
+            )
+            if lessons:
+                lines = [f"- {l['content'][:200]}" for l in lessons]
+                context_parts.append(
+                    "## 历史改进提示（过往类似问题的自评教训，请提前规避）\n" + "\n".join(lines)
+                )
+        except Exception as exc:  # noqa: BLE001 — 教训是增强项，失败不阻塞回答
+            logger.warning("答案教训召回失败（忽略）：%s", exc)
 
     # 意图区分：有发票才输出查验类章节；纯政策问答直接自然作答，不做格式化模板
     if invoice is not None:
