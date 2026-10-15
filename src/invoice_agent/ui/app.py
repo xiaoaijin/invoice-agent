@@ -43,9 +43,18 @@ NODE_LABELS = {
 
 CSS = """
 <style>
-    /* 隐藏 Streamlit 原生 chrome */
+    /* 隐藏 Streamlit 原生 chrome（顶栏仅做透明，不能 display:none——
+       侧边栏收起后的展开箭头挂在顶栏里，藏掉顶栏就再打不开了） */
     #MainMenu, footer {visibility: hidden;}
-    header[data-testid="stHeader"] {display: none;}
+    header[data-testid="stHeader"] {
+        background: transparent; height: 2.2rem; pointer-events: none;
+    }
+    /* 展开箭头要可点击：单独恢复事件 + 白底圆角便于看清 */
+    header[data-testid="stHeader"] [data-testid="stExpandSidebarButton"],
+    header[data-testid="stHeader"] [data-testid="stSidebarCollapsedControl"] {
+        pointer-events: auto; background: #fff; border: 1px solid #e5e7eb;
+        border-radius: 8px; box-shadow: 0 1px 4px rgba(17, 24, 39, .08);
+    }
     .block-container {
         padding-top: 1.4rem; padding-bottom: 0; max-width: 1200px;
         min-height: calc(100vh - 50px); display: flex; flex-direction: column;
