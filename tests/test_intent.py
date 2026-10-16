@@ -106,6 +106,23 @@ class TestLlmFallback:
         assert r.domain == "deduction"
         assert r.source == "llm"
 
+    def test_placeholder_template_filled_into_system(self, monkeypatch):
+        """v2 参数化模板：对话历史与当前输入在 system prompt 中被真实值替换。"""
+        captured = {}
+
+        def fake_llm(messages):
+            captured["system"] = messages[0]["content"]
+            captured["user"] = messages[1]["content"]
+            return '{"retrieval_type": "new_question", "domain": "policy"}'
+
+        monkeypatch.setattr(intent_mod, "default_llm_fn", lambda: fake_llm)
+        _classify("餐饮发票全额抵扣吗", HISTORY, _cfg())
+        system_text = captured["system"]
+        assert "{chat_history}" not in system_text
+        assert "{user_input}" not in system_text
+        assert "餐饮发票全额抵扣吗" in system_text
+        assert captured["user"]  # user 消息非空（触发分类）
+
     def test_garbage_degrades_to_default(self, monkeypatch):
         monkeypatch.setattr(intent_mod, "default_llm_fn", lambda: lambda m: "乱输出不是 JSON")
         r = _classify("餐饮发票全额抵扣吗", HISTORY, _cfg())

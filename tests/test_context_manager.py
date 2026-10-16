@@ -4,6 +4,7 @@ from invoice_agent.config import ContextConfig
 from invoice_agent.services.context_manager import (
     _render_entry,
     _split_keep_window,
+    build_summary_prompt,
     compress_history,
     estimate_tokens,
     fit_budget,
@@ -129,3 +130,32 @@ class TestFitBudget:
         assert estimate_tokens(result) <= 8000
         assert result.endswith(text[-10:])  # 保留后半段
         assert result.startswith("（前文已因超长截断")
+
+
+class TestSummaryPromptParams:
+    def test_placeholder_template_filled_into_system(self):
+        """summarize v2 参数化模板：此前摘要与对话填入 system prompt（真实 registry 文本）。"""
+        messages = build_summary_prompt(
+            "此前讨论过发票查验",
+            [
+                {"role": "user", "content": "餐饮发票能抵扣吗"},
+                {"role": "assistant", "content": "不能抵扣"},
+            ],
+            None,  # 从真实 registry 取 summarize 当前版本
+        )
+        system_text = messages[0].content
+        human_text = messages[-1].content
+        assert "{prev_summary}" not in system_text
+        assert "{conversation}" not in system_text
+        assert "此前讨论过发票查验" in system_text
+        assert "餐饮发票能抵扣吗" in system_text
+        assert human_text  # user 消息非空（触发摘要）
+
+    def test_legacy_prompt_keeps_human_payload(self):
+        """v1 非参数化文本：摘要与对话仍走 human 消息。"""
+        legacy = "你是对话摘要器。"
+        messages = build_summary_prompt(
+            "旧摘要", [{"role": "user", "content": "问题"}], legacy
+        )
+        assert messages[0].content == legacy
+        assert "旧摘要" in messages[-1].content

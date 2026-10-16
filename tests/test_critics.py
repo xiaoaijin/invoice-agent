@@ -95,6 +95,30 @@ class TestCritiqueAnswer:
         r = critique_answer("回答", _state(), self._llm_returning(payload), pass_score=0.7)
         assert r.retrieval_issues == []
 
+    def test_placeholder_template_filled_into_system(self):
+        """v3 参数化模板：占位符在 system prompt 中被真实值替换，user 消息仅作触发。"""
+        findings = [Finding(rule_id="R001", rule_name="x", level=RiskLevel.HIGH, message="假发票")]
+        captured = {}
+
+        def fake_llm(messages):
+            captured["system"] = messages[0]["content"]
+            captured["user"] = messages[1]["content"]
+            return '{"sufficiency": 0.9, "relevance": 0.9, "completeness": 0.9, "score": 0.9, "issues": []}'
+
+        r = critique_answer(
+            "最终回答",
+            _state(user_question="这张发票有问题吗", risk_findings=findings),
+            fake_llm,
+            pass_score=0.7,
+        )
+        assert r.passed
+        system_text = captured["system"]
+        assert "{user_query}" not in system_text
+        assert "这张发票有问题吗" in system_text
+        assert "最终回答" in system_text
+        assert "[高] R001 假发票" in system_text  # 风控发现进 ground_truth
+        assert captured["user"]  # user 消息非空（触发评审）
+
 
 # ---- ② field_self_check ----
 
@@ -108,6 +132,24 @@ class TestFieldSelfCheck:
     def test_clean(self):
         r = field_self_check(make_invoice(), lambda m: '{"issues": []}')
         assert r == []
+
+    def test_placeholder_template_filled_into_system(self):
+        """v2 参数化模板：发票 JSON 与当前日期在 system prompt 中被真实值替换。"""
+        captured = {}
+
+        def fake_llm(messages):
+            captured["system"] = messages[0]["content"]
+            captured["user"] = messages[1]["content"]
+            return '{"issues": []}'
+
+        invoice = make_invoice()
+        r = field_self_check(invoice, fake_llm)
+        assert r == []
+        system_text = captured["system"]
+        assert "{invoice_json}" not in system_text
+        assert invoice.model_dump_json(indent=2) in system_text
+        assert "{current_date}" not in system_text
+        assert captured["user"]  # user 消息非空（触发质检）
 
     def test_garbage_degrades_to_empty(self):
         assert field_self_check(make_invoice(), lambda m: "乱输出") == []
@@ -177,6 +219,25 @@ class TestReviewRisk:
     def test_none_llm_fn(self):
         original = [_finding("R001")]
         assert review_risk(original, make_invoice(), None).adjusted == original
+
+    def test_placeholder_template_filled_into_system(self):
+        """v2 参数化模板：发票 JSON 与发现列表在 system prompt 中被真实值替换。"""
+        captured = {}
+
+        def fake_llm(messages):
+            captured["system"] = messages[0]["content"]
+            captured["user"] = messages[1]["content"]
+            return '{"adjusted": [], "removed": [], "added": [], "summary": ""}'
+
+        invoice = make_invoice()
+        r = review_risk([_finding("R001")], invoice, fake_llm)
+        assert r.adjusted == [_finding("R001")]
+        system_text = captured["system"]
+        assert "{invoice_json}" not in system_text
+        assert "{findings_json}" not in system_text
+        assert invoice.model_dump_json(indent=2) in system_text
+        assert "R001" in system_text
+        assert captured["user"]  # user 消息非空（触发复核）
 
 
 # ---- 图级：自评回环 ----

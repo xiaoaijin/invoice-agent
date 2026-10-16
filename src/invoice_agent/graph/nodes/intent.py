@@ -74,10 +74,21 @@ def _classify(question: str, history: list[dict], cfg: IntentConfig) -> IntentRe
                 f"{'用户' if e.get('role') == 'user' else '助手'}：{e.get('content', '')}"
                 for e in history[-4:]  # 最近 2 轮
             )
-            user_content = f"## 最近对话\n{recent or '（无）'}\n\n## 当前问题\n{q}"
+            recent = recent or "（无）"
+            system_text = prompt.text
+            if "{user_input}" in system_text:
+                # 参数化模板（v2+）：占位符填入 system prompt，user 消息仅作触发。
+                # 用 replace 而非 str.format：模板内 JSON 示例/表格的花括号无需转义。
+                system_text = (
+                    system_text.replace("{chat_history}", recent).replace("{user_input}", q)
+                )
+                user_content = "请依据以上信息完成意图分类，仅按 Output Format 输出 JSON。"
+            else:
+                # 旧版非参数化 prompt（v1）：对话与问题仍走 user 消息
+                user_content = f"## 最近对话\n{recent}\n\n## 当前问题\n{q}"
             raw = llm_fn(
                 [
-                    {"role": "system", "content": prompt.text},
+                    {"role": "system", "content": system_text},
                     {"role": "user", "content": user_content},
                 ]
             )

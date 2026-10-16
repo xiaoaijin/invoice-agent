@@ -83,18 +83,33 @@ def _rewrite_query(query: str, state: AgentState) -> str:
     """
     try:
         with use("query_rewrite") as prompt:
-            recent = "\n".join(
-                f"{'用户' if e.get('role') == 'user' else '助手'}：{e.get('content', '')}"
-                for e in (state.get("chat_history") or [])[-4:]  # 最近 2 轮
+            recent = (
+                "\n".join(
+                    f"{'用户' if e.get('role') == 'user' else '助手'}：{e.get('content', '')}"
+                    for e in (state.get("chat_history") or [])[-4:]  # 最近 2 轮
+                )
+                or "（无）"
             )
-            domain = (state.get("intent") or {}).get("domain", "")
-            user_content = (
-                f"## 最近对话\n{recent or '（无）'}\n\n"
-                f"## 业务领域\n{domain or '（未知）'}\n\n"
-                f"## 待改写的检索查询\n{query}"
-            )
+            domain = (state.get("intent") or {}).get("domain", "") or "（未知）"
+            system_text = prompt.text
+            if "{query}" in system_text:
+                # 参数化模板（v3+）：占位符填入 system prompt，human 消息仅作触发。
+                # 用 replace 而非 str.format：模板内样例文本无需转义。
+                system_text = (
+                    system_text.replace("{chat_history}", recent)
+                    .replace("{domain}", domain)
+                    .replace("{query}", query)
+                )
+                user_content = "请输出消解指代后的完整检索查询，一行以内，不要解释。"
+            else:
+                # 旧版非参数化 prompt（v1/v2）：对话与查询仍走 human 消息
+                user_content = (
+                    f"## 最近对话\n{recent}\n\n"
+                    f"## 业务领域\n{domain}\n\n"
+                    f"## 待改写的检索查询\n{query}"
+                )
             messages = [
-                SystemMessage(content=prompt.text),
+                SystemMessage(content=system_text),
                 HumanMessage(content=user_content),
             ]
             rewritten = get_chat_model().invoke(messages).content.strip()
@@ -210,64 +225,80 @@ def finalize(state: AgentState) -> dict:
             logger.warning("长期记忆召回失败（忽略）：%s", exc)
 
     # ---- 组装 prompt ----
-    context_parts = []
-    if summary:
-        context_parts.append(f"## 早期对话摘要\n{summary}")
-    if recalled:
-        mem_lines = [f"- {m['content'][:300]}（相关度 {m['score']:.2f}）" for m in recalled]
-        context_parts.append("## 相关历史记忆（语义召回）\n" + "\n".join(mem_lines))
-    if invoice is not None:
-        context_parts.append(_invoice_block(state, invoice))
     chunks = state.get("rag_chunks") or []
-    context_parts.append("## 参考条款（检索结果）\n\n" + format_chunks_for_prompt(chunks))
-    if state.get("user_question"):
-        context_parts.append(f"## 用户问题\n{state['user_question']}")
-    # 自反馈：自评不通过时带上改进提示重生成（有界，见 critic_answer/route_after_critique）
-    critic_fb = state.get("critic_feedback")
-    if critic_fb:
-        context_parts.append(f"## 上一版回答的不足（请针对性改进，其余内容保持）\n{critic_fb}")
-    # 历史教训：过往相似问题自评发现的答案类不足，提前规避（当轮已有 critic_feedback 时跳过，避免重复）
-    elif state.get("user_question"):
-        try:
-            lcfg = cfg.feedback.lessons
-            lessons = get_lesson_store().recall(
-                state["user_question"],
-                kind="answer",
-                top_k=lcfg.recall_top_k,
-                min_score=lcfg.min_score,
-            )
-            if lessons:
-                lines = [f"- {l['content'][:200]}" for l in lessons]
-                context_parts.append(
-                    "## 历史改进提示（过往类似问题的自评教训，请提前规避）\n" + "\n".join(lines)
-                )
-        except Exception as exc:  # noqa: BLE001 — 教训是增强项，失败不阻塞回答
-            logger.warning("答案教训召回失败（忽略）：%s", exc)
-
-    # 意图区分：有发票才输出查验类章节；纯政策问答直接自然作答，不做格式化模板
-    if invoice is not None:
-        output_rule = (
-            "请按以下结构输出 Markdown：发票概览 / 验真结论 / 重复性 / 风险提示 / "
-            "政策依据（[来源N] 引用列表）。"
-            '结合对话历史理解追问（如"那出租车票呢"指上一问题中的票据类型）。'
-        )
-    else:
-        output_rule = (
-            "本次未上传发票，属于纯政策问答：请直接、自然地回答用户问题本身，"
-            "不要套用任何固定章节模板，禁止输出发票概览 / 验真结论 / 重复性 / 风险提示"
-            "等发票查验类内容，也不要声明「未提供发票」；"
-            "政策结论按 system prompt 要求标注 [来源N] 引用。"
-            '结合对话历史理解追问（如"那出租车票呢"指上一问题中的票据类型）。'
-        )
-    prompt_text = "\n\n".join(context_parts) + "\n\n" + output_rule
-    # 预算兜底：完整 prompt 超上限时从头截断
-    prompt_text = fit_budget(prompt_text, cfg.context.token_budget)
-
     # prompt 版本管理：use() 解析 qa 当前版本并登记 contextvar（监控据此落库），
-    # A/B 抽样按 session_id 粘性分桶（finalize 重生成轮不换 prompt）
+    # A/B 抽样按 session_id 粘性分桶（finalize 重生成轮不换 prompt）。
+    # with 块包住组装与 invoke：先解析版本以决定占位符填充路径，块内禁止再 get 同名 prompt
     with use("qa", sticky_key=state.get("session_id")) as qa_prompt:
+        context_parts = []
+        if summary:
+            context_parts.append(f"## 早期对话摘要\n{summary}")
+        if recalled:
+            mem_lines = [f"- {m['content'][:300]}（相关度 {m['score']:.2f}）" for m in recalled]
+            context_parts.append("## 相关历史记忆（语义召回）\n" + "\n".join(mem_lines))
+        if invoice is not None:
+            context_parts.append(_invoice_block(state, invoice))
+        if "{user_query}" in qa_prompt.text:
+            # 参数化模板（v3+）：用户问题与参考条款填入 system prompt，human 消息只承载其余上下文。
+            # 用 replace 而非 str.format：模板内 JSON/引用示例的花括号无需转义。
+            # 条款是 human 消息的大头，预算先花在它身上（其余上下文随后还有 fit_budget 兜底）
+            reference_clauses = (
+                fit_budget(format_chunks_for_prompt(chunks), cfg.context.token_budget)
+                or "（无）"
+            )
+            system_text = (
+                qa_prompt.text
+                .replace("{user_query}", state.get("user_question") or "（无，发票查验汇总）")
+                .replace("{reference_clauses}", reference_clauses)
+            )
+        else:
+            # 旧版非参数化 prompt（v1/v2）：问题与条款仍走 human 消息
+            system_text = qa_prompt.text
+            context_parts.append("## 参考条款（检索结果）\n\n" + format_chunks_for_prompt(chunks))
+            if state.get("user_question"):
+                context_parts.append(f"## 用户问题\n{state['user_question']}")
+        # 自反馈：自评不通过时带上改进提示重生成（有界，见 critic_answer/route_after_critique）
+        critic_fb = state.get("critic_feedback")
+        if critic_fb:
+            context_parts.append(f"## 上一版回答的不足（请针对性改进，其余内容保持）\n{critic_fb}")
+        # 历史教训：过往相似问题自评发现的答案类不足，提前规避（当轮已有 critic_feedback 时跳过，避免重复）
+        elif state.get("user_question"):
+            try:
+                lcfg = cfg.feedback.lessons
+                lessons = get_lesson_store().recall(
+                    state["user_question"],
+                    kind="answer",
+                    top_k=lcfg.recall_top_k,
+                    min_score=lcfg.min_score,
+                )
+                if lessons:
+                    lines = [f"- {l['content'][:200]}" for l in lessons]
+                    context_parts.append(
+                        "## 历史改进提示（过往类似问题的自评教训，请提前规避）\n" + "\n".join(lines)
+                    )
+            except Exception as exc:  # noqa: BLE001 — 教训是增强项，失败不阻塞回答
+                logger.warning("答案教训召回失败（忽略）：%s", exc)
+
+        # 意图区分：有发票才输出查验类章节；纯政策问答直接自然作答，不做格式化模板
+        if invoice is not None:
+            output_rule = (
+                "请按以下结构输出 Markdown：发票概览 / 验真结论 / 重复性 / 风险提示 / "
+                "政策依据（[来源N] 引用列表）。"
+                '结合对话历史理解追问（如"那出租车票呢"指上一问题中的票据类型）。'
+            )
+        else:
+            output_rule = (
+                "本次未上传发票，属于纯政策问答：请直接、自然地回答用户问题本身，"
+                "不要套用任何固定章节模板，禁止输出发票概览 / 验真结论 / 重复性 / 风险提示"
+                "等发票查验类内容，也不要声明「未提供发票」；"
+                "政策结论按 system prompt 要求标注 [来源N] 引用。"
+                '结合对话历史理解追问（如"那出租车票呢"指上一问题中的票据类型）。'
+            )
+        prompt_text = "\n\n".join(context_parts) + "\n\n" + output_rule
+        # 预算兜底：完整 prompt 超上限时从头截断
+        prompt_text = fit_budget(prompt_text, cfg.context.token_budget)
         messages = [
-            SystemMessage(content=qa_prompt.text),
+            SystemMessage(content=system_text),
             *_history_messages(history),
             HumanMessage(content=prompt_text),
         ]

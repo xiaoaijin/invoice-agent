@@ -209,6 +209,96 @@ class TestGraphFlow:
         assert state["intent"]["retrieval_type"] == "chat"
 
 
+class TestFinalizePromptParams:
+    def test_qa_placeholder_filled_into_system(self, monkeypatch):
+        """qa v3 参数化模板：用户问题与参考条款填入 system prompt，human 消息不再重复。"""
+        import invoice_agent.graph.nodes.answer as answer_mod
+        from langchain_core.messages import AIMessage
+
+        captured = {}
+
+        class FakeModel:
+            def invoke(self, messages):
+                captured["messages"] = messages
+                return AIMessage(content="测试回答")
+
+        monkeypatch.setattr(answer_mod, "get_chat_model", lambda: FakeModel())
+        state = {
+            "session_id": "t-params",
+            "user_question": "餐饮发票能抵扣吗",
+            "rag_chunks": [],
+            "chat_history": [],
+        }
+        answer_mod.finalize(state)
+        messages = captured["messages"]
+        system_text = messages[0].content
+        human_text = messages[-1].content
+        assert "{user_query}" not in system_text
+        assert "{reference_clauses}" not in system_text
+        assert "餐饮发票能抵扣吗" in system_text
+        assert "（未检索到相关条款）" in system_text
+        assert "## 用户问题" not in human_text  # 问题已入 system，human 不重复
+        assert "## 参考条款" not in human_text
+
+    def test_query_rewrite_placeholder_filled_into_system(self, monkeypatch):
+        """query_rewrite v3 参数化模板：对话/领域/查询填入 system prompt。"""
+        import invoice_agent.graph.nodes.answer as answer_mod
+        from langchain_core.messages import AIMessage
+
+        captured = {}
+
+        class FakeModel:
+            def invoke(self, messages):
+                captured["messages"] = messages
+                return AIMessage(content="出租车发票 进项税额 抵扣 政策")
+
+        monkeypatch.setattr(answer_mod, "get_chat_model", lambda: FakeModel())
+        state = {
+            "chat_history": [
+                {"role": "user", "content": "增值税专用发票的认证期限是多久"},
+                {"role": "assistant", "content": "……"},
+            ],
+            "intent": {"domain": "deduction"},
+        }
+        q = answer_mod._rewrite_query("那出租车票呢", state)
+        assert q == "出租车发票 进项税额 抵扣 政策"
+        system_text = captured["messages"][0].content
+        assert "{chat_history}" not in system_text
+        assert "{domain}" not in system_text
+        assert "{query}" not in system_text
+        assert "那出租车票呢" in system_text
+        assert "增值税专用发票的认证期限是多久" in system_text
+
+    def test_recognize_placeholder_filled_into_system(self, monkeypatch):
+        """recognize v2 参数化模板：当前日期与重试反馈填入 system prompt。"""
+        import invoice_agent.graph.nodes.recognize as recognize_mod
+
+        captured = {}
+
+        class FakeStructured:
+            def invoke(self, messages):
+                captured["messages"] = messages
+                return make_invoice()
+
+        class FakeVision:
+            def with_structured_output(self, schema):
+                return FakeStructured()
+
+        monkeypatch.setattr(recognize_mod, "get_vision_model", lambda: FakeVision())
+        monkeypatch.setattr(recognize_mod, "default_llm_fn", lambda: None)  # 跳过 LLM 字段自检
+        state = {
+            "session_id": "t-recog",
+            "page_images": ["data:image/png;base64,xx"],
+            "extract_error": "发票号码位数异常",
+        }
+        result = recognize_mod.recognize(state)
+        assert result["invoice"] is not None
+        system_text = captured["messages"][0].content
+        assert "{current_date}" not in system_text
+        assert "{retry_feedback}" not in system_text
+        assert "发票号码位数异常" in system_text  # 重试反馈进 system
+
+
 class TestCheckExtract:
     def test_valid(self):
         assert recognize_mod.check_extract(make_invoice()) == []

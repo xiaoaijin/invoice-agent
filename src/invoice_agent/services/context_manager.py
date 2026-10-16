@@ -81,10 +81,22 @@ def build_summary_prompt(
 
         system_prompt = get_registry().get("summarize").text
 
+    conversation = "\n".join(_render_entry(e) for e in old_entries)
+    if "{conversation}" in system_prompt:
+        # 参数化模板（v2+）：此前摘要与对话填入 system prompt，human 消息仅作触发。
+        # 用 replace 而非 str.format：模板内 [工具 xxx] 等示例无需转义。
+        system_text = system_prompt.replace(
+            "{prev_summary}", prev_summary or "（无，首轮摘要）"
+        ).replace("{conversation}", conversation)
+        return [
+            SystemMessage(content=system_text),
+            HumanMessage(content="请输出压缩后的摘要正文。"),
+        ]
+    # 旧版非参数化 prompt（v1）：摘要与对话走 human 消息
     parts = []
     if prev_summary:
         parts.append(f"【此前摘要】\n{prev_summary}\n")
-    parts.append("【待压缩历史对话】\n" + "\n".join(_render_entry(e) for e in old_entries))
+    parts.append("【待压缩历史对话】\n" + conversation)
     return [SystemMessage(content=system_prompt), HumanMessage(content="\n".join(parts))]
 
 

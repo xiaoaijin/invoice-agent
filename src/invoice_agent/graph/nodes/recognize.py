@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import date
+
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from invoice_agent.config import get_app_config
@@ -33,18 +35,26 @@ def recognize(state: AgentState) -> dict:
     if not page_images:
         return {}
 
-    content = [{"type": "text", "text": "请识别这张发票并输出结构化数据。"}]
+    content = [{"type": "text", "text": "请识别以上发票图片并输出结构化数据。"}]
     for data_url in page_images:
         content.append({"type": "image_url", "image_url": {"url": data_url}})
-    # 重试时把上次的校验错误反馈给模型
     prev_error = state.get("extract_error")
-    if prev_error:
-        content[0]["text"] += f"\n\n上一次提取存在以下问题，请特别注意：\n{prev_error}"
 
     # prompt 版本管理：use() 解析当前版本并登记 contextvar（监控据此落库），
     # with 块包住 LLM invoke，A/B 抽样按 session_id 粘性分桶
     with use("recognize", sticky_key=state.get("session_id")) as prompt:
-        messages = [SystemMessage(content=prompt.text), HumanMessage(content=content)]
+        system_text = prompt.text
+        if "{retry_feedback}" in system_text:
+            # 参数化模板（v2+）：当前日期与重试反馈填入 system prompt，human 消息只带图片与触发语。
+            # 用 replace 而非 str.format：模板内花括号示例无需转义。
+            system_text = (
+                system_text.replace("{current_date}", date.today().isoformat())
+                .replace("{retry_feedback}", prev_error or "（无，首次提取）")
+            )
+        elif prev_error:
+            # 旧版非参数化 prompt（v1）：重试反馈走 human 消息
+            content[0]["text"] += f"\n\n上一次提取存在以下问题，请特别注意：\n{prev_error}"
+        messages = [SystemMessage(content=system_text), HumanMessage(content=content)]
         try:
             invoice = get_vision_model().with_structured_output(InvoiceData).invoke(messages)
         except Exception as exc:  # noqa: BLE001 — 网络/解析错误统一走重试

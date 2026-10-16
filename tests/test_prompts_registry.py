@@ -275,19 +275,44 @@ class TestUse:
 
 class TestRealPromptsDir:
     def test_real_prompts_load(self):
-        """真实 prompts 目录可加载：critique v2 / query_rewrite v2 / intent 均存在且 active 可解析。
+        """真实 prompts 目录可加载：critique v3 / query_rewrite v2 / intent 均存在且 active 可解析。
 
         防 name 与文件名 stem 不一致 / active 指向缺失版本（registry fail-fast 全局生效）。
         """
         from invoice_agent.config import get_app_config
 
         registry = PromptRegistry(get_app_config().prompts_dir, snapshot=False)
+        qa_prompt = registry.get("qa")
+        assert qa_prompt.version == "v3"
+        assert "{user_query}" in qa_prompt.text
+        assert "{reference_clauses}" in qa_prompt.text
         critique = registry.get("critique")
-        assert critique.version == "v2"
+        assert critique.version == "v3"
+        assert "{user_query}" in critique.text
+        assert "{assistant_response}" in critique.text
+        assert "{ground_truth}" in critique.text
         assert "retrieval_issues" in critique.text
+        field_check = registry.get("field_check")
+        assert field_check.version == "v2"
+        assert "{invoice_json}" in field_check.text
+        assert "{current_date}" in field_check.text
         rewrite = registry.get("query_rewrite")
         assert rewrite.name == "query_rewrite"
-        assert rewrite.version == "v2"
+        assert rewrite.version == "v3"
+        assert "{chat_history}" in rewrite.text
+        assert "{domain}" in rewrite.text
+        assert "{query}" in rewrite.text
         intent_prompt = registry.get("intent")
         assert intent_prompt.name == "intent"
-        assert "retrieval_type" in intent_prompt.text
+        assert intent_prompt.version == "v2"
+        assert "{chat_history}" in intent_prompt.text
+        assert "{user_input}" in intent_prompt.text
+        for name, placeholders in (
+            ("risk_review", ("{invoice_json}", "{findings_json}")),
+            ("recognize", ("{current_date}", "{retry_feedback}")),
+            ("summarize", ("{prev_summary}", "{conversation}")),
+        ):
+            meta = registry.get(name)
+            assert meta.version == "v2", name
+            for ph in placeholders:
+                assert ph in meta.text, (name, ph)

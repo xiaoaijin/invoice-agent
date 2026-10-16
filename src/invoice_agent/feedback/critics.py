@@ -88,35 +88,32 @@ def critique_answer(
     if llm_fn is None:
         return CritiqueResult()
     findings = state.get("risk_findings") or []
-    fact_parts: list[str] = []
-    invoice = state.get("invoice")
-    if invoice is not None:
-        fact_parts.append(
-            f"发票数据：{invoice.summary_text() if hasattr(invoice, 'summary_text') else invoice}"
-        )
-    if findings:
-        fact_parts.append(
-            "风控发现：" + "；".join(f"[{f.level.value}] {f.rule_id} {f.message}" for f in findings)
-        )
-    chunks = state.get("rag_chunks") or []
-    if chunks:
-        fact_parts.append("检索条款：" + " | ".join(c.doc_title for c in chunks[:5]))
-    verification = state.get("verification")
-    if verification is not None:
-        fact_parts.append(f"验真结论：{verification.status}（{verification.message}）")
 
-    user_prompt = (
-        f"## 用户问题\n{state.get('user_question') or '（无，发票查验汇总）'}\n\n"
-        f"## 助手回答\n{answer}\n\n"
-        f"## 系统事实\n" + ("\n".join(fact_parts) or "（无）")
-    )
+    user_query = state.get("user_question") or "（无，发票查验汇总）"
     # use() 登记当前 prompt 到 contextvar（监控追溯），with 块包住 llm_fn 调用
     try:
         with use("critique") as system_prompt:
+            system_text = system_prompt.text
+            if "{user_query}" in system_text:
+                # 参数化模板（v3+）：占位符填入 system prompt，user 消息仅作触发。
+                # 用 replace 而非 str.format：模板内 JSON 示例的花括号无需转义。
+                system_text = (
+                    system_text.replace("{user_query}", user_query)
+                    .replace("{assistant_response}", answer)
+                    .replace("{ground_truth}", _ground_truth_text(state))
+                )
+                user_content = "请依据以上信息完成评审，仅按 Output Format 输出 JSON。"
+            else:
+                # 旧版非参数化 prompt（v1/v2）：事实仍走 user 消息
+                user_content = (
+                    f"## 用户问题\n{user_query}\n\n"
+                    f"## 助手回答\n{answer}\n\n"
+                    f"## 系统事实\n{_ground_truth_text(state)}"
+                )
             raw = llm_fn(
                 [
-                    {"role": "system", "content": system_prompt.text},
-                    {"role": "user", "content": user_prompt},
+                    {"role": "system", "content": system_text},
+                    {"role": "user", "content": user_content},
                 ]
             )
     except Exception as exc:  # noqa: BLE001
@@ -151,6 +148,28 @@ def critique_answer(
     )
 
 
+def _ground_truth_text(state: AgentState) -> str:
+    """汇总事实依据（发票数据/风控发现/检索条款/验真结论），供 prompt 的 {ground_truth} 占位符填充。"""
+    fact_parts: list[str] = []
+    invoice = state.get("invoice")
+    if invoice is not None:
+        fact_parts.append(
+            f"发票数据：{invoice.summary_text() if hasattr(invoice, 'summary_text') else invoice}"
+        )
+    findings = state.get("risk_findings") or []
+    if findings:
+        fact_parts.append(
+            "风控发现：" + "；".join(f"[{f.level.value}] {f.rule_id} {f.message}" for f in findings)
+        )
+    chunks = state.get("rag_chunks") or []
+    if chunks:
+        fact_parts.append("检索条款：" + " | ".join(c.doc_title for c in chunks[:5]))
+    verification = state.get("verification")
+    if verification is not None:
+        fact_parts.append(f"验真结论：{verification.status}（{verification.message}）")
+    return "\n".join(fact_parts) or "（无）"
+
+
 # ---- ② 识票字段自检 ----
 
 
@@ -160,13 +179,23 @@ def field_self_check(invoice: InvoiceData, llm_fn: LlmFn) -> list[str]:
         return []
     try:
         with use("field_check") as system_prompt:
+            system_text = system_prompt.text
+            if "{invoice_json}" in system_text:
+                # 参数化模板（v2+）：占位符填入 system prompt，user 消息仅作触发。
+                # 用 replace 而非 str.format：模板内 JSON 示例的花括号无需转义。
+                system_text = system_text.replace(
+                    "{invoice_json}", invoice.model_dump_json(indent=2)
+                ).replace("{current_date}", _today())
+                user_content = "请依据以上白名单完成质检，仅按 Output Format 输出 JSON。"
+            else:
+                # 旧版非参数化 prompt（v1）：数据仍走 user 消息
+                user_content = (
+                    f"当前日期：{_today()}\n发票 JSON：\n{invoice.model_dump_json(indent=2)}"
+                )
             raw = llm_fn(
                 [
-                    {"role": "system", "content": system_prompt.text},
-                    {
-                        "role": "user",
-                        "content": f"当前日期：{_today()}\n发票 JSON：\n{invoice.model_dump_json(indent=2)}",
-                    },
+                    {"role": "system", "content": system_text},
+                    {"role": "user", "content": user_content},
                 ]
             )
     except Exception as exc:  # noqa: BLE001
@@ -200,14 +229,24 @@ def review_risk(findings: list[Finding], invoice: InvoiceData | None, llm_fn: Ll
         ensure_ascii=False,
         indent=2,
     )
-    user_prompt = (
-        f"发票 JSON：\n{invoice.model_dump_json(indent=2)}\n\n风险发现列表：\n{findings_json}"
-    )
     data: dict[str, Any] | None = None
     with use("risk_review") as system_prompt:  # with 块包住全部重试调用
+        system_text = system_prompt.text
+        if "{invoice_json}" in system_text:
+            # 参数化模板（v2+）：占位符填入 system prompt，user 消息仅作触发。
+            # 用 replace 而非 str.format：模板内 JSON 示例的花括号无需转义。
+            system_text = system_text.replace(
+                "{invoice_json}", invoice.model_dump_json(indent=2)
+            ).replace("{findings_json}", findings_json)
+            user_content = "请依据以上信息完成风控复核，仅按 Output Format 输出 JSON。"
+        else:
+            # 旧版非参数化 prompt（v1）：数据仍走 user 消息
+            user_content = (
+                f"发票 JSON：\n{invoice.model_dump_json(indent=2)}\n\n风险发现列表：\n{findings_json}"
+            )
         messages = [
-            {"role": "system", "content": system_prompt.text},
-            {"role": "user", "content": user_prompt},
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": user_content},
         ]
         for attempt in range(2):  # 解析失败重试 1 次
             try:
