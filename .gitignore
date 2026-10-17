@@ -8,6 +8,8 @@ dist/
 
 # 密钥与环境
 .env
+# 本机 Claude Code 项目说明，不入库
+CLAUDE.md
 
 # 运行时数据
 data/
