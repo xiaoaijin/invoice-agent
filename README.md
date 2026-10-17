@@ -14,6 +14,7 @@
 | 上下文管理 | 单次交互 token 上限（字符估算）；历史达预算 60% 时自动压缩：最近 10 轮原样保留，更早内容滚动摘要化，工具调用只留工具名+结果；prompt 组装后还有预算兜底截断 |
 | 长期记忆 | 每轮问答以向量存入 PostgreSQL (pgvector)，跨会话语义召回相关历史；会话滚动摘要持久化，重启不丢；PG 不可用时自动降级 |
 | Prompt 版本管理 | `prompts/*.yaml` 为唯一源（多版本 + 激活版本 + A/B 权重），解析优先级：显式指定 > config overrides > A/B 加权抽样 > YAML `active`；每次 LLM 调用把 prompt 名/版本/内容 hash 写入监控库，支持调用链追溯与按版本统计调用量/成功率/成本 |
+| A/B 评估看板 | 「Prompt 版本」页支持人工标注（对每条真实输出按 1~5 评分 + 备注，按 LLM 调用粒度落库）与对比报告（按版本聚合调用量/成功率/耗时/成本/人工分，可下载 Markdown）；CLI `prompts report <name>` 输出同一份报告 |
 | 全流程监控 | 独立 SQLite（`data/monitor.db`）记录 run/node span、延迟、token 用量与成本（按 config.yaml 价目折算），超预算/低成功率告警；旁路设计，写失败不反噬主流程 |
 | 自反馈优化 | 回答质量 LLM 自评（不合格重生成 ≤1 次）、识票字段 LLM 级自检、风控结论 LLM 复核（误报移除/漏报补充）；LLM 不可用时静默降级放行 |
 | 意图识别漏斗 | 关键词 → 追问正则 → LLM 兜底三层分类（检索类型 + 业务领域），追问触发 LLM 查询改写、闲聊短路跳过检索 |
@@ -65,6 +66,7 @@ uv run python -m invoice_agent.cli prompts list                              # p
 uv run python -m invoice_agent.cli prompts show qa --version v2              # 查看 prompt 全文
 uv run python -m invoice_agent.cli prompts set-active qa v1                  # 切换激活版本（回写 YAML）
 uv run python -m invoice_agent.cli prompts usage                             # 按 prompt 名+版本统计调用量/成功率/成本
+uv run python -m invoice_agent.cli prompts report qa                          # A/B 对比报告（调用指标 + 人工标注均分）
 uv run python -m invoice_agent.cli serve                                     # 启动 HTTP API（默认 127.0.0.1:8000）
 ```
 
@@ -130,6 +132,7 @@ START → intake → [intent 意图漏斗] → [route_entry] ─┬→ recognize
 - **上下文管理**（`services/context_manager.py`）：token 字符估算（CJK≈1/字、ASCII≈4字符/token）；历史超 `token_budget` 的 60% 触发压缩——最近 10 轮原样保留、更早内容由对话模型做滚动摘要（工具调用只留工具名+结果）、摘要存入 `history_summary` 与 PG `memory_summaries`；最终 prompt 由 `fit_budget` 兜底截断保证不超上限
 - **长期记忆**（`services/memory_store.py`）：每轮问答 Q+A 合并嵌入存 PG `memory_chunks`（HNSW 索引），新问题向量召回 top-k 相关历史注入 prompt；PG 不可用时全部静默降级
 - **Prompt 版本管理**（`prompts/registry.py` + `prompts/*.yaml`）：每个 prompt 一个 YAML（`versions`/`active`/`weight`）；解析优先级为显式 version 参数 > `config.yaml prompts.overrides` > A/B 加权抽样（`ab_enabled: true` 时按 weight 加权）> YAML 内 `active`。调用时经 contextvar 把 prompt 名/版本/hash（sha256 前 12 位）写入监控库 `llm_calls` 三列，全部版本快照旁路 upsert 到 monitor.db 供跨库追溯；YAML 缺失/损坏 fail-fast，快照写失败静默降级
+- **A/B 人工评估**（`ui/prompt_eval.py` + 监控库 `prompt_annotations` 表）：看板「Prompt 版本」页对 `llm_calls` 中某 prompt 的每次真实调用标注 1~5 分与备注（`llm_call_id` 唯一，可覆盖更新），与调用指标一起按版本聚合成对比报告；标注与报告同源（`MonitorStore`），UI 与 CLI `prompts report` 共用
 - **全流程监控**（`monitoring/`）：runs / node_spans / llm_calls 三张表记 run 状态、节点延迟与重试、token 用量与成本（按 `config.yaml monitoring.pricing` 每千 token 折算），节点/run 延迟超预算、单 run 重试过多、近 20 次成功率 < 90% 触发告警；全部写入吞异常只打 warning，绝不反噬主流程
 - **意图识别漏斗**（`graph/nodes/intent.py`）：关键词匹配 → 追问正则 → LLM 兜底（前几层零成本同步，仅都未定性时调 LLM），输出两层意图——检索类型（新问题/追问/闲聊）+ 业务领域（政策/抬头/抵扣/报销/查验）；追问触发 `query_rewrite` LLM 改写查询（前置到首次检索，失败降级原查询），闲聊短路跳过检索；关键词表在 `config.yaml intent` 节可运营调整
 - **自反馈优化**（`feedback/critics.py`）：三个可注入 LLM 的 critic——回答质量自评（综合评分 < `pass_score` 时带反馈重生成 ≤ `max_retries` 次）、识票字段自检、风控结论复核（误报移除/漏报补充，单次修订不回环）；LLM 为 None 或调用异常时静默降级放行
@@ -152,4 +155,3 @@ START → intake → [intent 意图漏斗] → [route_entry] ─┬→ recognize
 - 验真接入百望云/诺诺真实 API
 - 企业微信/钉钉/飞书机器人接入、批量异步处理
 - LangGraph checkpointer 跨进程持久化（当前 MemorySaver 为进程内；UI 会话消息已持久化到 `data/chat_history.db`，生产可进一步换 SqliteSaver/PostgresSaver）
-- Prompt A/B 评估看板（当前 `prompts usage` 已按版本统计调用量/成功率/成本，缺人工标注与对比报告）

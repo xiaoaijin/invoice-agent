@@ -70,6 +70,19 @@ CREATE TABLE IF NOT EXISTS prompt_versions (
     PRIMARY KEY (name, version)
 );
 
+CREATE TABLE IF NOT EXISTS prompt_annotations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    llm_call_id INTEGER NOT NULL UNIQUE,  -- 关联 llm_calls.id（一次调用一条标注，可覆盖更新）
+    run_id TEXT,
+    prompt_name TEXT,
+    prompt_version TEXT,
+    rating INTEGER NOT NULL,        -- 人工评分 1~5（5 最好）
+    note TEXT,
+    created_at TEXT,
+    updated_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_annot_prompt ON prompt_annotations(prompt_name);
+
 CREATE TABLE IF NOT EXISTS alerts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT,
@@ -237,6 +250,31 @@ class MonitorStore:
         except Exception as exc:  # noqa: BLE001
             logger.warning("监控写库失败（upsert_prompt_version）：%s", exc)
 
+    def upsert_annotation(
+        self,
+        llm_call_id: int,
+        rating: int,
+        note: str | None = None,
+        *,
+        run_id: str | None = None,
+        prompt_name: str | None = None,
+        prompt_version: str | None = None,
+    ) -> None:
+        """人工标注（UI 提交）：按 llm_call_id 唯一，重复提交覆盖 rating/note。"""
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    "INSERT INTO prompt_annotations "
+                    "(llm_call_id, run_id, prompt_name, prompt_version, rating, note, "
+                    " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(llm_call_id) DO UPDATE SET "
+                    "rating=excluded.rating, note=excluded.note, updated_at=excluded.updated_at",
+                    (llm_call_id, run_id, prompt_name, prompt_version, rating, note,
+                     _now(), _now()),
+                )
+        except Exception as exc:  # noqa: BLE001 — 监控不反噬主流程
+            logger.warning("监控写库失败（upsert_annotation）：%s", exc)
+
     def write_alert(self, run_id: str, alert_type: str, severity: str, detail: str) -> None:
         try:
             with self._conn() as conn:
@@ -326,6 +364,42 @@ class MonitorStore:
             rows = conn.execute(
                 "SELECT name, version, hash, description, created_at FROM prompt_versions "
                 "ORDER BY name, version"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def recent_calls_for_prompt(self, prompt_name: str, limit: int = 50) -> list[dict]:
+        """某 prompt 最近的 LLM 调用，连带已有人工标注（A/B 标注工作区的数据源）。"""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT l.id AS llm_call_id, l.run_id, l.node, l.model, l.prompt_version, "
+                "l.latency_ms, l.success, r.started_at, "
+                "a.rating, a.note, a.updated_at AS annotated_at "
+                "FROM llm_calls l "
+                "LEFT JOIN runs r ON r.run_id = l.run_id "
+                "LEFT JOIN prompt_annotations a ON a.llm_call_id = l.id "
+                "WHERE l.prompt_name = ? "
+                "ORDER BY l.id DESC LIMIT ?",
+                (prompt_name, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def version_report(self, prompt_name: str) -> list[dict]:
+        """按版本聚合调用指标 + 人工标注（A/B 对比报告的数据源）。"""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT l.prompt_version, "
+                "COUNT(*) AS calls, "
+                "AVG(CASE WHEN l.success = 1 THEN 1.0 ELSE 0.0 END) AS success_rate, "
+                "AVG(l.latency_ms) AS avg_latency_ms, "
+                "SUM(COALESCE(l.cost_yuan, 0)) AS cost_yuan, "
+                "COUNT(a.id) AS annotated, "
+                "AVG(a.rating) AS avg_rating "
+                "FROM llm_calls l "
+                "LEFT JOIN prompt_annotations a ON a.llm_call_id = l.id "
+                "WHERE l.prompt_name = ? "
+                "GROUP BY l.prompt_version "
+                "ORDER BY calls DESC",
+                (prompt_name,),
             ).fetchall()
         return [dict(r) for r in rows]
 

@@ -643,7 +643,7 @@ def render_prompts_tab() -> None:
     st.code(meta.text, language="text")
     st.caption(f"hash：{meta.hash}")
 
-    st.subheader("⚖️ A/B 调用分布")
+    st.subheader("⚖️ A/B 评估")
     try:
         from invoice_agent.monitoring.store import MonitorStore
 
@@ -652,24 +652,32 @@ def render_prompts_tab() -> None:
     except Exception as exc:  # noqa: BLE001 — 监控降级时提示即可
         st.caption(f"监控不可用（{exc}）")
         return
-    rows = [u for u in usage if u["prompt_name"] == name]
-    if not rows:
-        st.caption("该 prompt 暂无调用记录")
-        return
-    st.dataframe(
-        [
-            {
-                "版本": u["prompt_version"] or "?",
-                "调用量": u["calls"],
-                "成功率": f"{u['success_rate']:.0%}" if u["success_rate"] is not None else "—",
-                "平均耗时(ms)": round(u["avg_latency_ms"] or 0),
-                "成本(元)": round(u["cost_yuan"] or 0, 4),
-            }
-            for u in rows
-        ],
-        use_container_width=True,
-        hide_index=True,
-    )
+    from invoice_agent.ui.prompt_eval import render_annotation_section, render_report_section
+
+    tab_usage, tab_annot, tab_report = st.tabs(["调用分布", "🏷 人工标注", "📊 对比报告"])
+    with tab_usage:
+        rows = [u for u in usage if u["prompt_name"] == name]
+        if not rows:
+            st.caption("该 prompt 暂无调用记录")
+        else:
+            st.dataframe(
+                [
+                    {
+                        "版本": u["prompt_version"] or "?",
+                        "调用量": u["calls"],
+                        "成功率": f"{u['success_rate']:.0%}" if u["success_rate"] is not None else "—",
+                        "平均耗时(ms)": round(u["avg_latency_ms"] or 0),
+                        "成本(元)": round(u["cost_yuan"] or 0, 4),
+                    }
+                    for u in rows
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+    with tab_annot:
+        render_annotation_section(store, name)
+    with tab_report:
+        render_report_section(store, name)
 
 
 def render_input_bar() -> tuple[bool, str | None]:

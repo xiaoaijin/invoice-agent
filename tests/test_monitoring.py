@@ -108,6 +108,86 @@ class TestMonitorStore:
         runs = MonitorStore(tmp_path / "m.db").recent_runs(5)
         assert runs[0]["run_id"] == "r1"
 
+    @staticmethod
+    def _seed_ab_calls(store: MonitorStore) -> list[int]:
+        """A/B 场景：v1 三次（两成一败）+ v2 两次（全成），返回按写入顺序的 call id。"""
+        store.start_run("r1", "t1", "invoice")
+        ids = []
+        for version, success, latency in [
+            ("v1", True, 800.0),
+            ("v1", False, 1200.0),
+            ("v1", True, 1000.0),
+            ("v2", True, 400.0),
+            ("v2", True, 600.0),
+        ]:
+            store.write_llm_call(
+                "r1", "recognize", "qwen-vl-max", 100, 50, 150, latency, 0.002, success,
+                prompt_name="recognize", prompt_version=version, prompt_hash="abc123",
+            )
+            ids.append(store.run_detail("r1")["llm_calls"][-1]["id"])
+        return ids
+
+    def test_annotation_upsert_and_readback(self, tmp_path: Path):
+        store = MonitorStore(tmp_path / "m.db")
+        (call_id,) = self._seed_ab_calls(store)[:1]
+
+        store.upsert_annotation(call_id, 4, "金额识别正确", run_id="r1",
+                                prompt_name="recognize", prompt_version="v1")
+        row = next(r for r in store.recent_calls_for_prompt("recognize")
+                   if r["llm_call_id"] == call_id)
+        assert row["rating"] == 4
+        assert row["note"] == "金额识别正确"
+
+        # 重复提交覆盖 rating/note（同一 llm_call_id 唯一）
+        store.upsert_annotation(call_id, 2, "漏了税号")
+        rows = store.recent_calls_for_prompt("recognize")
+        assert len(rows) == 5
+        row = next(r for r in rows if r["llm_call_id"] == call_id)
+        assert row["rating"] == 2
+        assert row["note"] == "漏了税号"
+
+        # 未标注的调用 rating 为 None
+        assert all(r["rating"] is None for r in rows if r["llm_call_id"] != call_id)
+
+    def test_annotation_failure_does_not_raise(self, tmp_path: Path):
+        store = MonitorStore(tmp_path / "m.db")
+        import sqlite3
+
+        conn = sqlite3.connect(store.db_path)
+        conn.execute("DROP TABLE prompt_annotations")
+        conn.commit()
+        conn.close()
+        store.upsert_annotation(999, 5)  # 不应抛异常
+
+    def test_version_report_aggregates_calls_and_ratings(self, tmp_path: Path):
+        store = MonitorStore(tmp_path / "m.db")
+        ids = self._seed_ab_calls(store)
+
+        store.upsert_annotation(ids[0], 5, prompt_name="recognize", prompt_version="v1")
+        store.upsert_annotation(ids[1], 1, prompt_name="recognize", prompt_version="v1")
+        store.upsert_annotation(ids[3], 4, prompt_name="recognize", prompt_version="v2")
+
+        report = {r["prompt_version"]: r for r in store.version_report("recognize")}
+        assert set(report) == {"v1", "v2"}
+        v1, v2 = report["v1"], report["v2"]
+        assert v1["calls"] == 3 and v2["calls"] == 2
+        assert v1["success_rate"] == 2 / 3
+        assert v2["success_rate"] == 1.0
+        assert v1["annotated"] == 2 and v2["annotated"] == 1
+        assert v1["avg_rating"] == 3.0
+        assert v2["avg_rating"] == 4.0
+        assert v1["avg_latency_ms"] == (800 + 1200 + 1000) / 3
+
+    def test_version_report_filters_by_prompt(self, tmp_path: Path):
+        store = MonitorStore(tmp_path / "m.db")
+        self._seed_ab_calls(store)
+        store.write_llm_call(
+            "r1", "finalize", "qwen-max", 10, 10, 20, 100.0, 0.001, True,
+            prompt_name="qa", prompt_version="v9",
+        )
+        report = store.version_report("recognize")
+        assert {r["prompt_version"] for r in report} == {"v1", "v2"}
+
 
 # ---- TraceCallbackHandler ----
 

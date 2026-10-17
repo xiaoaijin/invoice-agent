@@ -129,6 +129,33 @@ def cmd_prompts_usage(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_prompts_report(args: argparse.Namespace) -> int:
+    """按版本输出 A/B 对比报告（调用指标 + 人工标注聚合）。"""
+    from invoice_agent.config import get_app_config
+    from invoice_agent.monitoring.store import MonitorStore
+
+    rows = MonitorStore(get_app_config().monitoring_db_path).version_report(args.name)
+    if not rows:
+        print(f"（prompt {args.name} 暂无调用记录）")
+        return 0
+    _print_table(
+        ["version", "calls", "success_rate", "avg_latency", "cost", "annotated", "avg_rating"],
+        [
+            [
+                r["prompt_version"] or "?",
+                str(r["calls"]),
+                f"{r['success_rate']:.2f}" if r["success_rate"] is not None else "-",
+                f"{r['avg_latency_ms']:.0f}ms" if r["avg_latency_ms"] is not None else "-",
+                f"¥{r['cost_yuan']:.4f}",
+                str(r["annotated"]),
+                f"{r['avg_rating']:.2f}" if r["avg_rating"] is not None else "-",
+            ]
+            for r in rows
+        ],
+    )
+    return 0
+
+
 def cmd_chat(args: argparse.Namespace) -> int:
     """多轮对话 REPL：/invoice <文件> 查验发票，/new 重置会话，/quit 退出。"""
     thread_id = f"cli-chat-{args.session}"
@@ -210,6 +237,9 @@ def main(argv: list[str] | None = None) -> int:
     p_prompts_sub.add_parser("usage", help="按 prompt 名+版本查看调用量/成功率/成本").set_defaults(
         func=cmd_prompts_usage
     )
+    p_report = p_prompts_sub.add_parser("report", help="按版本输出 A/B 对比报告（含人工标注）")
+    p_report.add_argument("name", help="prompt 名")
+    p_report.set_defaults(func=cmd_prompts_report)
 
     p_serve = sub.add_parser("serve", help="启动 HTTP API（FastAPI/uvicorn，单 worker）")
     p_serve.add_argument("--host", default="127.0.0.1")
