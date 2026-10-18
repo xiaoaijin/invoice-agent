@@ -187,7 +187,8 @@ def cmd_chat(args: argparse.Namespace) -> int:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    """启动 HTTP API（uvicorn）。注意 checkpointer 为进程内实现，须单 worker 部署。"""
+    """启动 HTTP API（uvicorn）。须单 worker 部署：checkpointer 已可跨进程（postgres 后端），
+    但监控/台账/会话历史三个 SQLite 文件库与 BM25 进程内索引仍不兼容多 worker。"""
     import uvicorn
 
     uvicorn.run(
@@ -218,7 +219,11 @@ def main(argv: list[str] | None = None) -> int:
     p_ask.set_defaults(func=cmd_ask)
 
     p_chat = sub.add_parser("chat", help="多轮对话模式（支持追问与发票查验）")
-    p_chat.add_argument("--session", default="default", help="会话名（同一会话保留记忆）")
+    p_chat.add_argument(
+        "--session",
+        default="default",
+        help="会话名（同一会话保留记忆；postgres checkpointer 下跨进程/重启也恢复）",
+    )
     p_chat.set_defaults(func=cmd_chat)
 
     p_prompts = sub.add_parser("prompts", help="prompt 版本管理（查看/切换/用量）")

@@ -37,6 +37,10 @@ memory:
   enabled: true               # PG 不可用时自动降级为无长期记忆
   recall_top_k: 5             # 语义召回相关历史记忆条数
 
+checkpointer:
+  backend: "postgres"         # memory=进程内（单测/演示）；postgres=跨进程/跨重启，PG 不可用则启动报错
+  # dsn: 留空复用 .env 的 PG_DSN
+
 intent:
   enabled: true               # 意图识别漏斗总开关（关闭时所有问题按新问题处理，不调 LLM）
   llm_fallback: true          # 关键词/正则均未定性时是否允许 LLM 兜底

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field
@@ -131,6 +132,18 @@ class MemoryConfig(BaseModel):
     enabled: bool = True  # PG 不可用时自动降级，此开关用于彻底关闭
 
 
+class CheckpointerConfig(BaseModel):
+    """LangGraph checkpointer 持久化后端。
+
+    memory：进程内（默认，单元测试/单进程演示）；postgres：跨进程持久化（多轮会话
+    历史落 PG，重启/多副本可恢复）。backend=postgres 且 PG 不可用时启动 fail-fast
+    （不走静默降级——降级到 memory 会导致多 worker/多副本间静默串话）。
+    """
+
+    backend: Literal["memory", "postgres"] = "memory"
+    dsn: str | None = None  # 留空复用 .env 的 PG_DSN
+
+
 class CompanyConfig(BaseModel):
     name: str
     tax_id: str
@@ -164,6 +177,7 @@ class AppConfig(BaseModel):
     risk: RiskConfig
     context: ContextConfig = ContextConfig()
     memory: MemoryConfig = MemoryConfig()
+    checkpointer: CheckpointerConfig = Field(default_factory=CheckpointerConfig)
     monitoring: MonitoringConfig = MonitoringConfig()
     intent: IntentConfig = Field(default_factory=IntentConfig)
     feedback: FeedbackConfig = FeedbackConfig()

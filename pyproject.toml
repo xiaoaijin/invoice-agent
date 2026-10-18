@@ -21,6 +21,7 @@ dependencies = [
     "fastapi>=0.143.1",
     "uvicorn>=0.54.0",
     "python-multipart>=0.0.32",
+    "langgraph-checkpoint-postgres>=3.2,<4",
 ]
 
 [dependency-groups]

@@ -16,9 +16,9 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
+from invoice_agent.graph.checkpointer import get_checkpointer
 from invoice_agent.graph.nodes import (
     answer,
     critic,
@@ -76,4 +76,4 @@ def build_graph():
     )
     g.add_edge("finalize", "critic_answer")
 
-    return g.compile(checkpointer=MemorySaver())
+    return g.compile(checkpointer=get_checkpointer())

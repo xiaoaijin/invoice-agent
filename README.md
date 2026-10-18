@@ -10,7 +10,7 @@
 | 合规查验 | 验真（Mock Provider，接口抽象可切换百望云/诺诺）、抬头税号校验、重复报销检测（SQLite 台账） |
 | 政策问答 | RAG 混合检索（pgvector 语义 + BM25/jieba，RRF 融合），回答强制引用条款编号，检索不足时明确拒答 |
 | 异常预警 | 8 条规则：抬头不符 / 重复 / 连号 / 大额拆分 / 敏感商品 / 报销时效 / 日期异常 / 金额勾稽 |
-| 多轮对话 | checkpointer（MemorySaver）按 thread_id 持久化会话；支持追问（检索 query 自动拼上上一问题）；发票查验后可在对话中继续追问 |
+| 多轮对话 | checkpointer 按 thread_id 持久化会话（`config.yaml checkpointer.backend`：默认进程内 memory；postgres 时落 PG，跨进程/跨重启可恢复）；支持追问（检索 query 自动拼上上一问题）；发票查验后可在对话中继续追问 |
 | 上下文管理 | 单次交互 token 上限（字符估算）；历史达预算 60% 时自动压缩：最近 10 轮原样保留，更早内容滚动摘要化，工具调用只留工具名+结果；prompt 组装后还有预算兜底截断 |
 | 长期记忆 | 每轮问答以向量存入 PostgreSQL (pgvector)，跨会话语义召回相关历史；会话滚动摘要持久化，重启不丢；PG 不可用时自动降级 |
 | Prompt 版本管理 | `prompts/*.yaml` 为唯一源（多版本 + 激活版本 + A/B 权重），解析优先级：显式指定 > config overrides > A/B 加权抽样 > YAML `active`；每次 LLM 调用把 prompt 名/版本/内容 hash 写入监控库，支持调用链追溯与按版本统计调用量/成功率/成本 |
@@ -88,7 +88,7 @@ uv run invoice-agent serve --host 127.0.0.1 --port 8000   # FastAPI/uvicorn，�
 
 错误约定：LLM/PG 失败在节点内静默降级返回 200（业务结果含降级提示）；文件超大小上限 413、类型不符 415、run 不存在 404、服务未配置（如缺 API key）503。
 
-> **部署约束**：LangGraph checkpointer 为进程内 `MemorySaver`，多轮会话记忆不跨进程/worker 共享，必须**单 worker** 部署（`serve` 已固定 `workers=1`）；跨重启历史恢复走 `GET /chat/{id}/history`。每个响应带的 `run_id` 可用于 `GET /runs/{id}` 追溯，也是后续异步任务扩展（202 + 轮询）的预留锚点。
+> **部署约束**：必须**单 worker** 部署（`serve` 已固定 `workers=1`）——监控/台账/会话历史为 SQLite 文件库 + BM25 进程内索引，不兼容多 worker。checkpointer 后端可配（`config.yaml checkpointer.backend`）：`postgres` 时会话状态落 PG，跨进程/跨重启可恢复（PG 不可用则启动 fail-fast）；默认 `memory` 为进程内。跨重启历史恢复走 `GET /chat/{id}/history`。每个响应带的 `run_id` 可用于 `GET /runs/{id}` 追溯，也是后续异步任务扩展（202 + 轮询）的预留锚点。
 
 ## 演示路径（用合成样本）
 
@@ -128,7 +128,7 @@ START → intake → [intent 意图漏斗] → [route_entry] ─┬→ recognize
 - **验真**：`InvoiceVerifyProvider` 抽象 + Mock 实现（注册表命中 → 确定性结果；未命中 → 哈希伪随机 85% PASS）。接入百望云/诺诺时新增 Provider 实现即可，图节点零改动
 - **去重**：SQLite 台账，"确认提交报销"后才写入，避免查询污染连号/拆分判断；`file_sha256` 区分同文件重传
 - **RAG**：按「第X条」切分保引用完整 → `EMBEDDING_MODEL`（qwen3.7-text-embedding）+ **PostgreSQL pgvector** 语义检索 → jieba+BM25 → RRF 融合 → 引用编号来自切分元数据（非模型生成）；qa prompt v2 去模板化——直接自然作答，保留 [来源N] 引用与不足即拒答约束
-- **多轮记忆**：`MemorySaver` checkpointer 按 thread_id 持久化整个 AgentState（含 `chat_history`）；finalize 把历史转为消息注入 LLM；短问题/「那/为什么」开头的追问在检索时自动拼上上一问题补全语义；UI 多会话消息另存 SQLite `data/chat_history.db`（pydantic 模型带 `__type__` 标签序列化，重启恢复渲染）
+- **多轮记忆**：checkpointer 按 thread_id 持久化整个 AgentState（含 `chat_history`），后端由 `config.yaml checkpointer.backend` 决定（`memory` 进程内 / `postgres` 落 PG 跨进程跨重启，工厂见 `graph/checkpointer.py`）；finalize 把历史转为消息注入 LLM；短问题/「那/为什么」开头的追问在检索时自动拼上上一问题补全语义；UI 多会话消息另存 SQLite `data/chat_history.db`（pydantic 模型带 `__type__` 标签序列化，重启恢复渲染）
 - **上下文管理**（`services/context_manager.py`）：token 字符估算（CJK≈1/字、ASCII≈4字符/token）；历史超 `token_budget` 的 60% 触发压缩——最近 10 轮原样保留、更早内容由对话模型做滚动摘要（工具调用只留工具名+结果）、摘要存入 `history_summary` 与 PG `memory_summaries`；最终 prompt 由 `fit_budget` 兜底截断保证不超上限
 - **长期记忆**（`services/memory_store.py`）：每轮问答 Q+A 合并嵌入存 PG `memory_chunks`（HNSW 索引），新问题向量召回 top-k 相关历史注入 prompt；PG 不可用时全部静默降级
 - **Prompt 版本管理**（`prompts/registry.py` + `prompts/*.yaml`）：每个 prompt 一个 YAML（`versions`/`active`/`weight`）；解析优先级为显式 version 参数 > `config.yaml prompts.overrides` > A/B 加权抽样（`ab_enabled: true` 时按 weight 加权）> YAML 内 `active`。调用时经 contextvar 把 prompt 名/版本/hash（sha256 前 12 位）写入监控库 `llm_calls` 三列，全部版本快照旁路 upsert 到 monitor.db 供跨库追溯；YAML 缺失/损坏 fail-fast，快照写失败静默降级
@@ -154,4 +154,4 @@ START → intake → [intent 意图漏斗] → [route_entry] ─┬→ recognize
 - PaddleOCR 交叉验证、DashScope gte-rerank 精排
 - 验真接入百望云/诺诺真实 API
 - 企业微信/钉钉/飞书机器人接入、批量异步处理
-- LangGraph checkpointer 跨进程持久化（当前 MemorySaver 为进程内；UI 会话消息已持久化到 `data/chat_history.db`，生产可进一步换 SqliteSaver/PostgresSaver）
+- PG 重启后 checkpointer 长驻连接自动重连/连接池（当前运行时显式报错，重启进程即恢复）
