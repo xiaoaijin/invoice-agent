@@ -402,7 +402,6 @@ def _build_real_critic_graph(monkeypatch, tmp_path: Path, critique_results: list
     critique_results 按调用次序弹出；用尽后重复最后一个。
     """
     import invoice_agent.graph.nodes.answer as answer_mod
-    from invoice_agent.feedback.critics import CritiqueResult
     from invoice_agent.graph.nodes import critic, intake, recognize
 
     fake_cfg = AppConfig(

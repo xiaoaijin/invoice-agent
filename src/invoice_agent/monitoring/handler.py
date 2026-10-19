@@ -6,11 +6,14 @@
 - run 结束时按阈值评估五类告警
 
 所有回调方法体包 try/except：监控失败只打 debug 日志，不影响主流程。
+并发节点（如 verify ∥ dedup）的回调来自 LangGraph 内部线程池，实例字段统一受
+_lock（RLock，_finish_run 会在锁内被再次调用）保护。
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import uuid
 from typing import Any
@@ -54,6 +57,8 @@ class TraceCallbackHandler(BaseCallbackHandler):
         self.thread_id = thread_id
         self.run_type = run_type
         self.run_id = uuid.uuid4().hex
+        # 并发节点回调来自不同线程，共享可变状态统一加锁（可重入：_finish_run 在锁内再调）
+        self._lock = threading.RLock()
         # 供 UI 实时读取的事件缓冲
         self.events: list[dict] = []
         self._node_seq = 0
@@ -86,88 +91,91 @@ class TraceCallbackHandler(BaseCallbackHandler):
         **kwargs,
     ) -> None:
         try:
-            name = name or (serialized or {}).get("name") or "?"
-            if parent_run_id is None:
-                # root run：整个图的执行
-                self._root_open = True
-                self._run_started_ns = time.perf_counter_ns()
-                self.store.start_run(self.run_id, self.thread_id, self.run_type)
-                self._event(type="run_start")
-                return
-            if name in KNOWN_NODES:
-                # 同节点重复执行（重试）计数：含已结束的历史执行
-                self._node_exec[name] = self._node_exec.get(name, 0)
-                retry_of = self._node_exec[name]
-                self._node_exec[name] += 1
-                self._node_seq += 1
-                self._node_stack.append(
-                    {
-                        "run_id": run_id,
-                        "node": name,
-                        "seq": self._node_seq,
-                        "started_ns": time.perf_counter_ns(),
-                        "started_at": _now(),
-                        "retry_of": retry_of,
-                    }
-                )
-                self._event(type="node_start", node=name, retry_of=retry_of)
+            with self._lock:
+                name = name or (serialized or {}).get("name") or "?"
+                if parent_run_id is None:
+                    # root run：整个图的执行
+                    self._root_open = True
+                    self._run_started_ns = time.perf_counter_ns()
+                    self.store.start_run(self.run_id, self.thread_id, self.run_type)
+                    self._event(type="run_start")
+                    return
+                if name in KNOWN_NODES:
+                    # 同节点重复执行（重试）计数：含已结束的历史执行
+                    self._node_exec[name] = self._node_exec.get(name, 0)
+                    retry_of = self._node_exec[name]
+                    self._node_exec[name] += 1
+                    self._node_seq += 1
+                    self._node_stack.append(
+                        {
+                            "run_id": run_id,
+                            "node": name,
+                            "seq": self._node_seq,
+                            "started_ns": time.perf_counter_ns(),
+                            "started_at": _now(),
+                            "retry_of": retry_of,
+                        }
+                    )
+                    self._event(type="node_start", node=name, retry_of=retry_of)
         except Exception as exc:  # noqa: BLE001
             logger.debug("监控回调异常（on_chain_start）：%s", exc)
 
     def on_chain_end(self, outputs, *, run_id, parent_run_id=None, name=None, **kwargs) -> None:
         try:
-            frame = self._pop_frame(run_id)
-            if frame is None:
-                if parent_run_id is None:
-                    # 节点曾报错时，root 正常收尾也视为失败
-                    self._finish_run(status="failure" if self._had_node_error else "success")
-                return
-            latency = (time.perf_counter_ns() - frame["started_ns"]) / 1e6
-            self.store.write_span(
-                self.run_id,
-                frame["node"],
-                frame["seq"],
-                frame["started_at"],
-                latency,
-                "success",
-                frame["retry_of"],
-            )
-            self._event(
-                type="node_end",
-                node=frame["node"],
-                latency_ms=latency,
-                status="success",
-                retry_of=frame["retry_of"],
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("监控回调异常（on_chain_end）：%s", exc)
-
-    def on_chain_error(self, error, *, run_id, parent_run_id=None, **kwargs) -> None:
-        try:
-            frame = self._pop_frame(run_id)
-            msg = str(error)
-            self._had_node_error = True
-            if frame is not None:
+            with self._lock:
+                frame = self._pop_frame(run_id)
+                if frame is None:
+                    if parent_run_id is None:
+                        # 节点曾报错时，root 正常收尾也视为失败
+                        self._finish_run(status="failure" if self._had_node_error else "success")
+                    return
                 latency = (time.perf_counter_ns() - frame["started_ns"]) / 1e6
                 self.store.write_span(
                     self.run_id,
                     frame["node"],
-                    0,
+                    frame["seq"],
                     frame["started_at"],
                     latency,
-                    "failure",
+                    "success",
                     frame["retry_of"],
-                    msg,
                 )
                 self._event(
                     type="node_end",
                     node=frame["node"],
                     latency_ms=latency,
-                    status="failure",
+                    status="success",
                     retry_of=frame["retry_of"],
                 )
-            else:
-                self._finish_run(status="failure", error=msg)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("监控回调异常（on_chain_end）：%s", exc)
+
+    def on_chain_error(self, error, *, run_id, parent_run_id=None, **kwargs) -> None:
+        try:
+            with self._lock:
+                frame = self._pop_frame(run_id)
+                msg = str(error)
+                self._had_node_error = True
+                if frame is not None:
+                    latency = (time.perf_counter_ns() - frame["started_ns"]) / 1e6
+                    self.store.write_span(
+                        self.run_id,
+                        frame["node"],
+                        0,
+                        frame["started_at"],
+                        latency,
+                        "failure",
+                        frame["retry_of"],
+                        msg,
+                    )
+                    self._event(
+                        type="node_end",
+                        node=frame["node"],
+                        latency_ms=latency,
+                        status="failure",
+                        retry_of=frame["retry_of"],
+                    )
+                else:
+                    self._finish_run(status="failure", error=msg)
         except Exception as exc:  # noqa: BLE001
             logger.debug("监控回调异常（on_chain_error）：%s", exc)
 
@@ -209,7 +217,8 @@ class TraceCallbackHandler(BaseCallbackHandler):
             model = kwargs.get("model_name") or kwargs.get("model") or "?"
         except Exception as exc:  # noqa: BLE001
             logger.debug("监控回调异常（解析模型名）：%s", exc)
-        self._llm_starts[run_id] = {"started_ns": time.perf_counter_ns(), "model": model}
+        with self._lock:
+            self._llm_starts[run_id] = {"started_ns": time.perf_counter_ns(), "model": model}
 
     def on_chat_model_start(
         self, serialized, messages, *, run_id, parent_run_id=None, **kwargs
@@ -233,96 +242,98 @@ class TraceCallbackHandler(BaseCallbackHandler):
 
     def on_llm_error(self, error, *, run_id, parent_run_id=None, **kwargs) -> None:
         try:
-            start = self._llm_starts.pop(run_id, None)
-            latency = (time.perf_counter_ns() - start["started_ns"]) / 1e6 if start else 0.0
-            node = self._current_node()
-            meta = current_prompt()
-            self.store.write_llm_call(
-                self.run_id,
-                node,
-                start["model"] if start else "?",
-                None,
-                None,
-                None,
-                latency,
-                0.0,
-                False,
-                str(error),
-                prompt_name=meta.name if meta else None,
-                prompt_version=meta.version if meta else None,
-                prompt_hash=meta.hash if meta else None,
-            )
-            self._event(type="llm_end", node=node, success=False)
+            with self._lock:
+                start = self._llm_starts.pop(run_id, None)
+                latency = (time.perf_counter_ns() - start["started_ns"]) / 1e6 if start else 0.0
+                node = self._current_node()
+                meta = current_prompt()
+                self.store.write_llm_call(
+                    self.run_id,
+                    node,
+                    start["model"] if start else "?",
+                    None,
+                    None,
+                    None,
+                    latency,
+                    0.0,
+                    False,
+                    str(error),
+                    prompt_name=meta.name if meta else None,
+                    prompt_version=meta.version if meta else None,
+                    prompt_hash=meta.hash if meta else None,
+                )
+                self._event(type="llm_end", node=node, success=False)
         except Exception as exc:  # noqa: BLE001
             logger.debug("监控回调异常（on_llm_error）：%s", exc)
 
     def _on_model_end(self, run_id, response) -> None:
         try:
-            start = self._llm_starts.pop(run_id, None)
-            latency = (time.perf_counter_ns() - start["started_ns"]) / 1e6 if start else 0.0
-            model = start["model"] if start else "?"
-            # 模型名兜底：ChatResult.llm_output
-            try:
-                model = (response.llm_output or {}).get("model_name") or model
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("监控回调异常（解析 llm_output）：%s", exc)
+            with self._lock:
+                start = self._llm_starts.pop(run_id, None)
+                latency = (time.perf_counter_ns() - start["started_ns"]) / 1e6 if start else 0.0
+                model = start["model"] if start else "?"
+                # 模型名兜底：ChatResult.llm_output
+                try:
+                    model = (response.llm_output or {}).get("model_name") or model
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("监控回调异常（解析 llm_output）：%s", exc)
 
-            usage = {}
-            try:
-                gen = response.generations[0]
-                # 兼容历史嵌套结构：list[list[ChatGeneration]]
-                if isinstance(gen, list):
-                    gen = gen[0]
-                msg = gen.message
-                usage = msg.response_metadata.get("token_usage") or {}
-                if not usage:
-                    um = getattr(msg, "usage_metadata", None)
-                    if um:
-                        usage = {
-                            "prompt_tokens": um.get("input_tokens"),
-                            "completion_tokens": um.get("output_tokens"),
-                            "total_tokens": um.get("total_tokens"),
-                        }
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("监控回调异常（解析 token 用量）：%s", exc)
-            prompt = usage.get("prompt_tokens")
-            completion = usage.get("completion_tokens")
-            total = usage.get("total_tokens")
+                usage = {}
+                try:
+                    gen = response.generations[0]
+                    # 兼容历史嵌套结构：list[list[ChatGeneration]]
+                    if isinstance(gen, list):
+                        gen = gen[0]
+                    msg = gen.message
+                    usage = msg.response_metadata.get("token_usage") or {}
+                    if not usage:
+                        um = getattr(msg, "usage_metadata", None)
+                        if um:
+                            usage = {
+                                "prompt_tokens": um.get("input_tokens"),
+                                "completion_tokens": um.get("output_tokens"),
+                                "total_tokens": um.get("total_tokens"),
+                            }
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("监控回调异常（解析 token 用量）：%s", exc)
+                prompt = usage.get("prompt_tokens")
+                completion = usage.get("completion_tokens")
+                total = usage.get("total_tokens")
 
-            cost = calc_cost(model, prompt, completion, self.cfg.pricing)
-            if prompt is not None:
-                self._token_totals["prompt"] += prompt
-            if completion is not None:
-                self._token_totals["completion"] += completion
-            self._cost_total += cost
+                cost = calc_cost(model, prompt, completion, self.cfg.pricing)
+                if prompt is not None:
+                    self._token_totals["prompt"] += prompt
+                if completion is not None:
+                    self._token_totals["completion"] += completion
+                self._cost_total += cost
 
-            node = self._current_node()
-            # prompt 追溯：registry 在 use() 里登记 contextvar，此处读出落库（无则 NULL）
-            meta = current_prompt()
-            self.store.write_llm_call(
-                self.run_id,
-                node,
-                model,
-                prompt,
-                completion,
-                total,
-                latency,
-                cost,
-                True,
-                prompt_name=meta.name if meta else None,
-                prompt_version=meta.version if meta else None,
-                prompt_hash=meta.hash if meta else None,
-            )
-            self._event(
-                type="llm_end",
-                node=node,
-                model=model,
-                latency_ms=latency,
-                prompt_tokens=prompt,
-                completion_tokens=completion,
-                cost_yuan=round(cost, 6),
-                success=True,
-            )
+                node = self._current_node()
+                # prompt 追溯：registry 在 use() 里登记 contextvar，此处读出落库（无则 NULL）
+                meta = current_prompt()
+                self.store.write_llm_call(
+                    self.run_id,
+                    node,
+                    model,
+                    prompt,
+                    completion,
+                    total,
+                    latency,
+                    cost,
+                    True,
+                    prompt_name=meta.name if meta else None,
+                    prompt_version=meta.version if meta else None,
+                    prompt_hash=meta.hash if meta else None,
+                )
+                self._event(
+                    type="llm_end",
+                    node=node,
+                    model=model,
+                    latency_ms=latency,
+                    prompt_tokens=prompt,
+                    completion_tokens=completion,
+                    cost_yuan=round(cost, 6),
+                    success=True,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.debug("监控回调异常（on_llm_end）：%s", exc)
 

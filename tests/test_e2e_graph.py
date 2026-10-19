@@ -113,6 +113,37 @@ class TestGraphFlow:
         assert state["answer"] == "OK invoice=50000001"
         assert isinstance(state["risk_findings"], list)
 
+    def test_verify_dedup_parallel_join(self, graph):
+        """verify 与 dedup 并行（join 边保证两者都完成后才进 risk）。
+
+        注意：LangGraph 1.2 的 updates 流对同 superstep 的并行任务按任务分帧，
+        不能断言「同一 payload 同时含两节点」；join 语义由 R002 回归测试行为级保障。
+        """
+        visited: list[str] = []
+        for payload in graph.stream(
+            {"session_id": "t-par", "file_path": "x.png", "user_question": "能报销吗"},
+            config={"configurable": {"thread_id": "t-par"}},
+            stream_mode="updates",
+        ):
+            visited.extend(payload.keys())
+        assert visited.index("risk") > max(visited.index("verify"), visited.index("dedup"))
+
+    def test_r002_survives_parallel(self, graph, tmp_path):
+        """并发改造后 risk 仍能看到 dedup 的 duplicate_hits：R002 不被静默吞掉。"""
+        from invoice_agent.services.dedup_store import DedupStore
+
+        # seed 一张已提交的同号假票（sha 不同 → 非同一文件重复上传，走 R002 重复报销）
+        DedupStore(tmp_path / "g.db").save_reimbursement(
+            "50000001", "044032000111", "91330100MA28YYYYYY",
+            "91330100MA27XXXXXX", 113.0, date(2026, 10, 1), file_sha256="seeded",
+        )
+        state = graph.invoke(
+            {"session_id": "t-r002", "file_path": "x.png", "user_question": "能报销吗"},
+            config={"configurable": {"thread_id": "t-r002"}},
+        )
+        rule_ids = {f.rule_id for f in state["risk_findings"]}
+        assert "R002" in rule_ids
+
     def test_retry_then_success(self, tmp_path, monkeypatch):
         """提取失败 1 次后重试成功，应走重试边。"""
         from invoice_agent.graph import nodes
@@ -212,8 +243,9 @@ class TestGraphFlow:
 class TestFinalizePromptParams:
     def test_qa_placeholder_filled_into_system(self, monkeypatch):
         """qa v3 参数化模板：用户问题与参考条款填入 system prompt，human 消息不再重复。"""
-        import invoice_agent.graph.nodes.answer as answer_mod
         from langchain_core.messages import AIMessage
+
+        import invoice_agent.graph.nodes.answer as answer_mod
 
         captured = {}
 
@@ -242,8 +274,9 @@ class TestFinalizePromptParams:
 
     def test_query_rewrite_placeholder_filled_into_system(self, monkeypatch):
         """query_rewrite v3 参数化模板：对话/领域/查询填入 system prompt。"""
-        import invoice_agent.graph.nodes.answer as answer_mod
         from langchain_core.messages import AIMessage
+
+        import invoice_agent.graph.nodes.answer as answer_mod
 
         captured = {}
 

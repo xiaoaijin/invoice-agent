@@ -170,6 +170,9 @@ class UploadConfig(BaseModel):
     allowed_extensions: list[str] = Field(
         default_factory=lambda: [".png", ".jpg", ".jpeg", ".pdf"]
     )
+    image_max_long_edge_px: int = 2200  # 识票前长边缩放上限（vision 输入 token 随像素数涨）
+    image_jpeg_quality: int = 85  # 识票前统一 JPEG 有损重编码质量（原 PNG 强转体积更大）
+    pdf_render_dpi: int = 150  # PDF 逐页渲染 DPI（intake 转图用）
 
 
 class AppConfig(BaseModel):

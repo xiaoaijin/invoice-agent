@@ -4,9 +4,9 @@
 否则会连到本机真实 PG）。
 """
 
-import invoice_agent.services.lesson_store as lesson_store_mod
 import pytest
 
+import invoice_agent.services.lesson_store as lesson_store_mod
 from invoice_agent.services.lesson_store import LessonStore
 
 

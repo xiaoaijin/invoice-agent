@@ -24,10 +24,13 @@ NODE_LABELS = {
 
 
 def node_latency(handler: Any, node: str) -> float | None:
-    """从 handler 事件缓冲中取节点最近一次耗时（ms）。"""
+    """从 handler 事件缓冲中取节点最近一次耗时（ms）。
+
+    并发节点下回调来自 LangGraph 内部线程池，先快照再遍历避免与写入交错。
+    """
     if handler is None:
         return None
-    for e in reversed(handler.events):
+    for e in reversed(list(handler.events)):
         if e.get("type") == "node_end" and e.get("node") == node:
             return e.get("latency_ms")
     return None

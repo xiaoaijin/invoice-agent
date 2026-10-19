@@ -1,6 +1,7 @@
 """监控模块单测：SQLite 读写、成本计算、回调采集、阈值告警、日志幂等。"""
 
 import logging
+import threading
 import typing
 import uuid
 from pathlib import Path
@@ -331,6 +332,38 @@ class TestTraceCallbackHandler:
         handler.on_chain_end({}, run_id=uuid.uuid4(), parent_run_id=uuid.uuid4(), name="verify")
         handler.on_llm_error(RuntimeError("x"), run_id=uuid.uuid4())
         handler.on_chat_model_end(None, run_id=uuid.uuid4())  # response 为 None
+
+    def test_parallel_node_callbacks_thread_safe(self, tmp_path: Path):
+        """并发节点（verify ∥ dedup）回调来自 LangGraph 内部线程池：共享状态不竞态。"""
+        handler = self._handler(tmp_path)
+        root = uuid.uuid4()
+        handler.on_chain_start(None, {}, run_id=root, parent_run_id=None, name="LangGraph")
+
+        def run_node(name: str) -> None:
+            node = uuid.uuid4()
+            llm = uuid.uuid4()
+            handler.on_chain_start(None, {}, run_id=node, parent_run_id=root, name=name)
+            handler.on_chat_model_start(
+                {"kwargs": {"model_name": "qwen3.8-max"}}, [], run_id=llm, parent_run_id=node
+            )
+            handler.on_chat_model_end(_chat_result(), run_id=llm, parent_run_id=node)
+            handler.on_chain_end({}, run_id=node, parent_run_id=root, name=name)
+
+        threads = [threading.Thread(target=run_node, args=(n,)) for n in ("verify", "dedup")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        handler.on_chain_end({}, run_id=root, parent_run_id=None, name="LangGraph")
+
+        spans = handler.store.run_detail(handler.run_id)["spans"]
+        assert {s["node"] for s in spans} == {"verify", "dedup"}
+        assert all(s["status"] == "success" for s in spans)
+        # root 正常收尾：两个线程的 token 汇总无丢失（100+50 各一份）
+        runs = handler.store.recent_runs(1)
+        assert runs[0]["status"] == "success"
+        assert runs[0]["prompt_tokens"] == 200
+        assert runs[0]["completion_tokens"] == 100
 
 
 # ---- setup_logging ----

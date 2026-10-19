@@ -190,12 +190,26 @@ def save_conversation() -> None:
     _conv_store().save(st.session_state.thread_id, _conv_title(display), display)
 
 
-def _progress_writer(node: str, handler) -> None:
-    """run_stream 的实时进度回调：在 st.status 容器内逐行打勾。"""
-    label = NODE_LABELS.get(node, node)
-    latency = node_latency(handler, node)
-    line = f"✅ {label}" if latency is None else f"✅ {label}（{latency:.0f}ms）"
-    st.write(line)
+def _make_progress_writer():
+    """进度回调工厂：单个 placeholder 内按 NODE_LABELS 固定顺序重绘打勾行。
+
+    verify ∥ dedup 并行后节点完成顺序不稳定，不能按事件到达顺序逐行追加。
+    """
+
+    done: dict[str, float | None] = {}
+    ph = st.empty()
+
+    def writer(node: str, handler) -> None:
+        done[node] = node_latency(handler, node)
+        lines = []
+        for n in NODE_LABELS:
+            if n not in done:
+                continue
+            lat = done[n]
+            lines.append(f"✅ {NODE_LABELS[n]}" + (f"（{lat:.0f}ms）" if lat is not None else ""))
+        ph.markdown("\n\n".join(lines))
+
+    return writer
 
 
 def render_invoice_card(invoice) -> None:
@@ -462,7 +476,7 @@ def run_turn(
                 str(fpath) if fpath else None,
                 text or None,
                 thread_id,
-                progress_cb=_progress_writer,
+                progress_cb=_make_progress_writer(),
                 on_token=on_token,
             )
             done = sum(1 for e in handler.events if e["type"] == "node_end") if handler else 0

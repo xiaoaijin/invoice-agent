@@ -27,6 +27,9 @@ upload:
   max_size_mb: 10             # 上传文件大小上限（UI/API 入口与 intake 双重校验）
   max_pdf_pages: 5            # PDF 只取前 N 页转图（防大文件爆内存）
   allowed_extensions: [".png", ".jpg", ".jpeg", ".pdf"]
+  image_max_long_edge_px: 2200  # 识票前长边缩放上限（vision 输入 token 随像素数涨）
+  image_jpeg_quality: 85      # 识票前统一 JPEG 有损重编码质量（原 PNG 强转体积更大）
+  pdf_render_dpi: 150         # PDF 逐页渲染 DPI（intake 转图用）
 
 context:
   token_budget: 8000          # 单次 LLM 交互 token 上限（字符估算）

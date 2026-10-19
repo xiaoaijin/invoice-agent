@@ -1,4 +1,8 @@
-"""intake 节点：读取文件、判断类型、PDF 逐页转 base64 图片。"""
+"""intake 节点：读取文件、判断类型、PDF 逐页转 base64 图片。
+
+识票前统一做图像预处理（缩放 + JPEG 重编码）压缩 vision 输入 token；
+只改内存中的 page_images，不动磁盘原文件——dedup 的 file_sha256 语义不受影响。
+"""
 
 from __future__ import annotations
 
@@ -17,6 +21,21 @@ SUPPORTED = {".png", ".jpg", ".jpeg", ".pdf"}  # config 未配置时的兜底白
 
 def _to_data_url(img_bytes: bytes, mime: str) -> str:
     return f"data:{mime};base64,{base64.b64encode(img_bytes).decode()}"
+
+
+def _resize_encode(img: Image.Image) -> tuple[bytes, str]:
+    """识票前预处理：长边超限等比缩放，统一转 RGB 后 JPEG 编码（RGBA/L/P 兼容）。"""
+    cfg = get_app_config().upload
+    max_edge = cfg.image_max_long_edge_px
+    w, h = img.size
+    if max(w, h) > max_edge:
+        scale = max_edge / max(w, h)
+        img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=cfg.image_jpeg_quality)
+    return buf.getvalue(), "image/jpeg"
 
 
 def intake(state: AgentState) -> dict:
@@ -43,8 +62,10 @@ def intake(state: AgentState) -> dict:
                 if i >= cfg.max_pdf_pages:
                     truncated = len(doc) - cfg.max_pdf_pages
                     break
-                pix = page.get_pixmap(dpi=200)
-                page_images.append(_to_data_url(pix.tobytes("png"), "image/png"))
+                pix = page.get_pixmap(dpi=cfg.pdf_render_dpi)
+                with Image.open(io.BytesIO(pix.tobytes("png"))) as page_img:
+                    data, mime = _resize_encode(page_img)
+                page_images.append(_to_data_url(data, mime))
         if not page_images:
             return {"extract_error": "PDF 无内容页"}
         result: dict = {"file_type": "pdf", "page_images": page_images}
@@ -52,10 +73,9 @@ def intake(state: AgentState) -> dict:
             result["pages_truncated"] = truncated
         return result
 
-    img = Image.open(p)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    with Image.open(p) as img:
+        data, mime = _resize_encode(img)
     return {
         "file_type": suffix.lstrip("."),
-        "page_images": [_to_data_url(buf.getvalue(), "image/png")],
+        "page_images": [_to_data_url(data, mime)],
     }

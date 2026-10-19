@@ -2,14 +2,17 @@
 
 流程：
 START → intake → intent → route_entry ─┬─ 有文件 → recognize ⇄ check_extract（失败重试/降级）┐
-                                       │                                                  ├→ verify → dedup → risk → risk_review ┐
-                                       └─ 仅提问（闲聊短路 → finalize）→ retrieve_docs ────┘                                       │
-                                                ↓                                                                                 │
-                                             retrieve_docs ←──────────────────────────────────────────────────────────────────────┘
+                                       │                                                  ├→ (verify ∥ dedup) → risk → risk_review ┐
+                                       └─ 仅提问（闲聊短路 → finalize）→ retrieve_docs ────┘                                          │
+                                                ↓                                                                                    │
+                                             retrieve_docs ←─────────────────────────────────────────────────────────────────────────┘
                                                 ↓                              ↑
                                              finalize ⇄ critic_answer ─┬─ 通过 → END
                                                 ↑                      └─ 其余不通过（≤max_retries）→ finalize 重生成
                                                 └────────────────────────────┘
+
+verify 与 dedup 互不依赖（都只读 invoice），同 superstep 并行后 join 到 risk；
+risk 的 R002 规则依赖 dedup 的 duplicate_hits，故 risk/risk_review 保持串行。
 """
 
 from __future__ import annotations
@@ -56,14 +59,14 @@ def build_graph():
         route.route_entry,
         {"recognize": "recognize", "retrieve_docs": "retrieve_docs", "finalize": "finalize"},
     )
-    # 提取校验：通过→verify；失败重试→recognize（携带错误提示）；重试耗尽→finalize 降级
+    # 提取校验：通过→verify∥dedup 并行；失败重试→recognize（携带错误提示）；重试耗尽→finalize 降级
     g.add_conditional_edges(
         "recognize",
         route.route_after_extract,
-        {"verify": "verify", "recognize": "recognize", "finalize": "finalize"},
+        {"verify": "verify", "dedup": "dedup", "recognize": "recognize", "finalize": "finalize"},
     )
-    g.add_edge("verify", "dedup")
-    g.add_edge("dedup", "risk")
+    # verify 与 dedup 都只读 invoice、写字段互不相交，可同 superstep 并行；join 后进 risk
+    g.add_edge(["verify", "dedup"], "risk")
     g.add_edge("risk", "risk_review")
     g.add_edge("risk_review", "retrieve_docs")
     g.add_edge("retrieve_docs", "finalize")

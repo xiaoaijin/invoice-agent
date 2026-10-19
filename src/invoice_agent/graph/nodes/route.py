@@ -13,12 +13,15 @@ def route_entry(state) -> str:
     return "finalize"
 
 
-def route_after_extract(state) -> str:
-    """提取校验路由：失败重试 / 失败降级 / 通过。"""
+def route_after_extract(state) -> str | list[str]:
+    """提取校验路由：失败重试 / 失败降级 / 通过。
+
+    通过时返回 list 触发 verify 与 dedup 同 superstep 并行（LangGraph 条件边支持 fan-out）。
+    """
     invoice = state.get("invoice")
     error = state.get("extract_error")
     if invoice is not None and not error:
-        return "verify"
+        return ["verify", "dedup"]
     retry = state.get("recognize_retry", 0)
     if retry < 2:
         return "recognize"
