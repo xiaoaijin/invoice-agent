@@ -20,6 +20,16 @@ class InvoiceTypeEnum(str, Enum):
     UNKNOWN = "未知/无法识别"
 
 
+class ExpenseCategory(str, Enum):
+    """费用类别（recognize v3 由视觉模型输出，关键词规则在聚合层兜底）。"""
+
+    TRANSPORT = "交通"
+    DINING = "餐饮"
+    LODGING = "住宿"
+    OFFICE = "办公用品"
+    OTHER = "其他"
+
+
 class InvoiceItem(BaseModel):
     name: str
     specification: str | None = None
@@ -43,6 +53,8 @@ class InvoiceData(BaseModel):
     total_amount: float  # 价税合计
     items: list[InvoiceItem] = Field(default_factory=list)
     remarks: str | None = None
+    # 费用类别：v2 及以下 prompt 不输出该字段时填默认值，由规则层兜底修正
+    expense_category: ExpenseCategory = ExpenseCategory.OTHER
     # 模型自评置信度，驱动"人工复核"提示
     field_confidence: dict[str, float] = Field(default_factory=dict)
     overall_confidence: float = 0.0

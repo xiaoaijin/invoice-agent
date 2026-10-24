@@ -46,3 +46,20 @@ class RunDetailResponse(BaseModel):
     run: dict[str, Any] | None = None
     spans: list[dict[str, Any]] = Field(default_factory=list)
     llm_calls: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ReimbursePreviewResponse(BaseModel):
+    """批量报销预览：ReimburseBatch 的 JSON 形态（可剔除条目后回传 submit）。"""
+
+    batch: dict[str, Any]
+
+
+class ReimburseSubmitRequest(BaseModel):
+    batch: dict[str, Any]  # preview 返回的 batch（可按需剔除 items 后原样回传）
+
+    model_config = {"extra": "forbid"}
+
+
+class ReimburseSubmitResponse(BaseModel):
+    batch_id: str
+    submission: dict[str, Any]

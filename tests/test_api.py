@@ -254,3 +254,66 @@ class TestErrorMapping:
         resp = c.post("/ask", json={"question": "q"})
         assert resp.status_code == 503
         assert "DASHSCOPE_API_KEY" in resp.json()["detail"]
+
+
+class TestReimbursements:
+    def test_preview_happy_path(self, client):
+        """client fixture 已打桩全图节点，preview 走真实 run_batch 聚合。"""
+        c, _ = client
+        resp = c.post(
+            "/reimbursements/preview",
+            files=[
+                ("files", ("a.png", _png_bytes(), "image/png")),
+                ("files", ("b.png", _png_bytes(), "image/png")),
+            ],
+        )
+        assert resp.status_code == 200
+        batch = resp.json()["batch"]
+        assert len(batch["items"]) == 2
+        assert batch["items"][0]["invoice"]["invoice_number"] == "50000001"
+        assert batch["total_amount"] == pytest.approx(226.0)
+
+    def test_preview_bad_extension_415(self, client):
+        c, _ = client
+        resp = c.post(
+            "/reimbursements/preview",
+            files=[("files", ("evil.exe", b"MZ", "application/x-exe"))],
+        )
+        assert resp.status_code == 415
+
+    def test_preview_too_many_files_413(self, client):
+        import invoice_agent.api.app as app_mod
+
+        c, _ = client
+        n = app_mod.MAX_BATCH_FILES + 1
+        resp = c.post(
+            "/reimbursements/preview",
+            files=[("files", (f"f{i}.png", _png_bytes(), "image/png")) for i in range(n)],
+        )
+        assert resp.status_code == 413
+
+    def test_submit_writes_ledger(self, client):
+        c, _ = client
+        preview = c.post(
+            "/reimbursements/preview",
+            files=[("files", ("a.png", _png_bytes(), "image/png"))],
+        ).json()["batch"]
+        resp = c.post("/reimbursements/submit", json={"batch": preview})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["batch_id"] == preview["batch_id"]
+        assert body["submission"]["instance_id"].startswith("mock-")
+        # 台账已写入（重复报销检测即刻生效）
+        from invoice_agent.config import get_app_config
+        from invoice_agent.services.dedup_store import DedupStore
+
+        store = DedupStore(get_app_config().db_path)
+        assert store.get_batch(body["batch_id"]) is not None
+
+    def test_submit_invalid_batch_422(self, client):
+        c, _ = client
+        resp = c.post(
+            "/reimbursements/submit",
+            json={"batch": {"batch_id": "x", "items": [{"nonsense": 1}]}},
+        )
+        assert resp.status_code == 422

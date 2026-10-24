@@ -23,6 +23,7 @@ from invoice_agent.monitoring.setup import setup_logging
 from invoice_agent.runner import NODE_LABELS, node_latency, run_stream
 from invoice_agent.services.conversation_store import ConversationStore
 from invoice_agent.services.dedup_store import DedupStore
+from invoice_agent.ui.reimburse import render_reimburse_tab
 
 setup_logging()
 
@@ -762,7 +763,9 @@ def main() -> None:
     cfg = get_app_config()
     render_sidebar()
 
-    tab_chat, tab_monitor, tab_prompts = st.tabs(["💬 助手对话", "📈 监控面板", "📜 Prompt 版本"])
+    tab_chat, tab_reimburse, tab_monitor, tab_prompts = st.tabs(
+        ["💬 助手对话", "🧾 报销提交", "📈 监控面板", "📜 Prompt 版本"]
+    )
 
     # 重新生成：须在时间线渲染前处理——本 run 只实时渲染新气泡，避免元素 key 重复；
     # run_turn 结尾的 st.rerun 会跳过本次剩余渲染
@@ -786,6 +789,8 @@ def main() -> None:
         # 显示在输入框下方，直到 st.rerun 才归位
         live_slot = st.container()
         send_only, typed = render_input_bar()
+    with tab_reimburse:
+        render_reimburse_tab(cfg)
     with tab_monitor:
         render_monitor_tab()
     with tab_prompts:

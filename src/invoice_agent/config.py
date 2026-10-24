@@ -13,6 +13,8 @@ import yaml
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from invoice_agent.models.invoice import ExpenseCategory
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
@@ -25,6 +27,11 @@ class Settings(BaseSettings):
     model_chat: str = "qwen3.8-max"
     embedding_model: str = "qwen3.7-text-embedding"
     verify_provider: str = "mock"
+    # 报销审批流程提供方：mock（默认，本地打桩）| feishu（需配置下方凭证）
+    expense_flow_provider: str = "mock"
+    feishu_app_id: str = ""
+    feishu_app_secret: str = ""
+    feishu_approval_code: str = ""
     pg_dsn: str = "postgresql://invoice:invoice@localhost:5432/invoice_agent"
 
     model_config = SettingsConfigDict(
@@ -157,6 +164,15 @@ class PromptsConfig(BaseModel):
     overrides: dict[str, str] = Field(default_factory=dict)  # 强制版本，优先级最高，如 qa: v2
 
 
+class ReimburseConfig(BaseModel):
+    """批量报销批次配置。"""
+
+    title_prefix: str = "员工费用报销"  # 批次标题前缀，UI 可覆盖
+    categories: list[str] = Field(
+        default_factory=lambda: [c.value for c in ExpenseCategory]
+    )  # 与 ExpenseCategory 枚举值保持一致（tests/test_expense_models.py 把关）
+
+
 class PathsConfig(BaseModel):
     db: str = "data/invoice_agent.db"
     knowledge_dir: str = "knowledge"
@@ -186,6 +202,7 @@ class AppConfig(BaseModel):
     feedback: FeedbackConfig = FeedbackConfig()
     prompts: PromptsConfig = PromptsConfig()
     upload: UploadConfig = Field(default_factory=UploadConfig)
+    reimburse: ReimburseConfig = Field(default_factory=ReimburseConfig)
     paths: PathsConfig
 
     def resolve(self, rel: str) -> Path:

@@ -14,7 +14,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from invoice_agent.api import deps
 from invoice_agent.api.schemas import (
@@ -23,13 +23,19 @@ from invoice_agent.api.schemas import (
     ChatRequest,
     ChatResponse,
     InvoiceResponse,
+    ReimbursePreviewResponse,
+    ReimburseSubmitRequest,
+    ReimburseSubmitResponse,
     RunDetailResponse,
 )
 from invoice_agent.config import get_app_config
+from invoice_agent.models.reimburse import ReimburseBatch
 from invoice_agent.monitoring.setup import setup_logging
 from invoice_agent.runner import iter_run, run_stream
+from invoice_agent.services.reimburse_flow import run_batch, submit_batch
 
 DEFAULT_INVOICE_QUESTION = "这张发票能否报销？有什么风险？"
+MAX_BATCH_FILES = 50  # 单次批量报销的文件数上限（防误传与资源耗尽）
 
 
 def _dump(obj):
@@ -64,12 +70,11 @@ def create_app() -> FastAPI:
         probe.unlink()
         return {"status": "ok"}
 
-    @app.post("/invoices", response_model=InvoiceResponse)
-    def submit_invoice(
-        file: UploadFile = File(...),  # noqa: B008 — FastAPI 依赖注入惯用法
-        question: str = Form(default=DEFAULT_INVOICE_QUESTION),
-        session_id: str = Form(default=None),
-    ) -> InvoiceResponse:
+    def _save_upload(file: UploadFile) -> Path:
+        """校验并落盘上传文件（/invoices 与 /reimbursements 共用）。
+
+        扩展名不在白名单 → 415；超大小上限 → 413。
+        """
         cfg = get_app_config().upload
         fname = Path(file.filename or "upload").name  # 防路径穿越
         suffix = Path(fname).suffix.lower()
@@ -85,7 +90,15 @@ def create_app() -> FastAPI:
             chunks.append(chunk)
         dest = deps.uploads_dir() / f"{uuid.uuid4().hex[:8]}_{fname}"
         dest.write_bytes(b"".join(chunks))
+        return dest
 
+    @app.post("/invoices", response_model=InvoiceResponse)
+    def submit_invoice(
+        file: UploadFile = File(...),  # noqa: B008 — FastAPI 依赖注入惯用法
+        question: str = Form(default=DEFAULT_INVOICE_QUESTION),
+        session_id: str = Form(default=None),
+    ) -> InvoiceResponse:
+        dest = _save_upload(file)
         sid = session_id or uuid.uuid4().hex
         state, handler = run_stream(str(dest), question, sid)
         return InvoiceResponse(
@@ -98,6 +111,30 @@ def create_app() -> FastAPI:
             verification=_dump(state.get("verification")),
             duplicate_hits=[_dump(d) for d in state.get("duplicate_hits") or []],
             risk_findings=[_dump(f) for f in state.get("risk_findings") or []],
+        )
+
+    @app.post("/reimbursements/preview", response_model=ReimbursePreviewResponse)
+    def preview_reimbursements(
+        files: list[UploadFile] = File(...),  # noqa: B008 — FastAPI 依赖注入惯用法
+        title: str = Form(default=None),
+    ) -> ReimbursePreviewResponse:
+        """多文件批量识别并分类统计（不落台账）；单张失败不中断，见 items[].error。"""
+        if len(files) > MAX_BATCH_FILES:
+            raise HTTPException(413, f"单次最多 {MAX_BATCH_FILES} 个文件")
+        paths = [_save_upload(f) for f in files]
+        batch = run_batch(paths, title=title or None)
+        return ReimbursePreviewResponse(batch=batch.model_dump(mode="json"))
+
+    @app.post("/reimbursements/submit", response_model=ReimburseSubmitResponse)
+    def submit_reimbursement(req: ReimburseSubmitRequest) -> ReimburseSubmitResponse:
+        """提交审批流程并写台账（去重即刻生效）；批次内容以请求体为准（可剔除条目）。"""
+        try:
+            batch = ReimburseBatch.model_validate(req.batch)
+        except ValidationError as exc:
+            raise HTTPException(422, f"batch 数据不合法：{exc.errors(include_url=False)[:3]}") from exc
+        result = submit_batch(batch)
+        return ReimburseSubmitResponse(
+            batch_id=batch.batch_id, submission=result.model_dump(mode="json")
         )
 
     @app.post("/ask", response_model=AskResponse)

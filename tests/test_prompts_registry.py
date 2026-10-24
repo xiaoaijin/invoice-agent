@@ -307,12 +307,13 @@ class TestRealPromptsDir:
         assert intent_prompt.version == "v2"
         assert "{chat_history}" in intent_prompt.text
         assert "{user_input}" in intent_prompt.text
-        for name, placeholders in (
-            ("risk_review", ("{invoice_json}", "{findings_json}")),
-            ("recognize", ("{current_date}", "{retry_feedback}")),
-            ("summarize", ("{prev_summary}", "{conversation}")),
+        for name, placeholders, expected in (
+            ("risk_review", ("{invoice_json}", "{findings_json}"), "v2"),
+            # recognize v3 新增费用类别判定，占位符与 v2 一致
+            ("recognize", ("{current_date}", "{retry_feedback}"), "v3"),
+            ("summarize", ("{prev_summary}", "{conversation}"), "v2"),
         ):
             meta = registry.get(name)
-            assert meta.version == "v2", name
+            assert meta.version == expected, name
             for ph in placeholders:
                 assert ph in meta.text, (name, ph)
