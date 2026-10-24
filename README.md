@@ -1,6 +1,6 @@
 # 发票助手 Agent（MVP + 知识增强风控）
 
-基于 **LangGraph + Qwen 系列（阿里云 MaaS 专属端点 / DashScope 兼容模式）** 的发票助手：智能识票、验真、重复报销检测、风控预警、带引用的政策问答。模型经 `.env` 配置：识票 `MODEL_VISION`（默认 qwen3.5-omni-plus）、问答 `MODEL_CHAT`（默认 qwen3.8-max）、嵌入 `EMBEDDING_MODEL`（默认 qwen3.7-text-embedding）。
+基于 **LangGraph + Qwen 系列（阿里云 MaaS 专属端点 / DashScope 兼容模式）** 的发票助手：智能识票、验真、重复报销检测、风控预警、带引用的政策问答、多发票分类统计与批量报销提交（飞书审批）。模型经 `.env` 配置：识票 `MODEL_VISION`（默认 qwen3.5-omni-plus）、问答 `MODEL_CHAT`（默认 qwen3.8-max）、嵌入 `EMBEDDING_MODEL`（默认 qwen3.7-text-embedding）。
 
 ## 功能
 
@@ -10,6 +10,7 @@
 | 合规查验 | 验真（Mock Provider，接口抽象可切换百望云/诺诺）、抬头税号校验、重复报销检测（SQLite 台账） |
 | 政策问答 | RAG 混合检索（pgvector 语义 + BM25/jieba，RRF 融合），回答强制引用条款编号，检索不足时明确拒答 |
 | 异常预警 | 8 条规则：抬头不符 / 重复 / 连号 / 大额拆分 / 敏感商品 / 报销时效 / 日期异常 / 金额勾稽 |
+| 报销批量提交 | 多张发票一次性上传 → 逐张识票（复用完整链路：验真/查重/风控）→ 按费用类别（交通/餐饮/住宿/办公用品/其他）分类统计 → 预览明细可剔除 → 确认后提交飞书审批流程并写台账（Mock Provider，`ExpenseFlowProvider` 抽象可切换真实飞书） |
 | 多轮对话 | checkpointer 按 thread_id 持久化会话（`config.yaml checkpointer.backend`：默认进程内 memory；postgres 时落 PG，跨进程/跨重启可恢复）；支持追问（检索 query 自动拼上上一问题）；发票查验后可在对话中继续追问 |
 | 上下文管理 | 单次交互 token 上限（字符估算）；历史达预算 60% 时自动压缩：最近 10 轮原样保留，更早内容滚动摘要化，工具调用只留工具名+结果；prompt 组装后还有预算兜底截断 |
 | 长期记忆 | 每轮问答以向量存入 PostgreSQL (pgvector)，跨会话语义召回相关历史；会话滚动摘要持久化，重启不丢；PG 不可用时自动降级 |
@@ -18,7 +19,7 @@
 | 全流程监控 | 独立 SQLite（`data/monitor.db`）记录 run/node span、延迟、token 用量与成本（按 config.yaml 价目折算），超预算/低成功率告警；旁路设计，写失败不反噬主流程 |
 | 自反馈优化 | 回答质量 LLM 自评（不合格重生成 ≤1 次）、识票字段 LLM 级自检、风控结论 LLM 复核（误报移除/漏报补充）；LLM 不可用时静默降级放行 |
 | 意图识别漏斗 | 关键词 → 追问正则 → LLM 兜底三层分类（检索类型 + 业务领域），追问触发 LLM 查询改写、闲聊短路跳过检索 |
-| 界面 | Streamlit：千问式多会话聊天（会话列表、标题取首问、侧边栏可收起）+ 流式输出 + 上传查验 + 确认报销入台账；会话历史持久化到 SQLite（`data/chat_history.db`），重启可恢复 |
+| 界面 | Streamlit：千问式多会话聊天（会话列表、标题取首问、侧边栏可收起）+ 流式输出 + 上传查验 + 确认报销入台账 + 「报销提交」tab（多发票分类统计与批量提交流）；会话历史持久化到 SQLite（`data/chat_history.db`），重启可恢复 |
 
 ## 快速开始
 
@@ -84,6 +85,8 @@ uv run invoice-agent serve --host 127.0.0.1 --port 8000   # FastAPI/uvicorn，�
 | `POST /chat` | `{"message", "session_id"?}` 会话式多轮（同 session_id 共享记忆；缺省时服务端生成并回传） |
 | `GET /chat/{session_id}/history` | 会话历史（与 UI 的 `data/chat_history.db` 互通） |
 | `POST /chat/stream` | SSE 流式对话（`node`/`token`/`done` 三类事件） |
+| `POST /reimbursements/preview` | multipart 多文件上传（`files`，可选 `title`）→ 批量识别 + 分类统计预览 JSON（单张失败不中断，见 `items[].error`；单次 ≤50 个文件） |
+| `POST /reimbursements/submit` | `{"batch"}`（preview 返回的批次，可剔除条目后回传）→ 提交审批流程并写台账，返回 `instance_id` |
 | `GET /runs/{run_id}` | 查监控 run 明细（节点时间线 + LLM 调用级 token/成本/prompt 版本） |
 
 错误约定：LLM/PG 失败在节点内静默降级返回 200（业务结果含降级提示）；文件超大小上限 413、类型不符 415、run 不存在 404、服务未配置（如缺 API key）503。
@@ -124,7 +127,9 @@ START → intake → [intent 意图漏斗] → [route_entry] ─┬→ recognize
 （闲聊意图短路：仅提问且意图为 chat 时直接 finalize，跳过检索）
 ```
 
-- **识票**：视觉模型 `MODEL_VISION` + `with_structured_output(InvoiceData)`，温度 0，缺失字段填 null 禁止编造；字段级 LLM 自检可复用提取重试边（`feedback.field_check`）
+- **识票**：视觉模型 `MODEL_VISION` + `with_structured_output(InvoiceData)`，温度 0，缺失字段填 null 禁止编造；字段级 LLM 自检可复用提取重试边（`feedback.field_check`）；recognize v3 一并输出费用类别 `expense_category`（无法确定填「其他」）
+- **报销批量提交**（`services/reimburse_flow.py`）：不改动单票 LangGraph 图，service 层逐张调 `runner.iter_run`（每张独立 thread_id，识票重试/验真/查重/风控全部复用），聚合层调用 `rules/expense_category.py` 关键词规则兜底（模型输出「其他」时修正）；`build_summary` 支持按发票号剔除重算。台账侧 `reimbursement_batches` 批次表 + `reimbursements.batch_id`/`expense_category` 列（老库经 `DedupStore._ensure_columns` 幂等迁移），批次提交即入台账、重复报销检测即刻生效
+- **审批流程 Provider**（`services/expense_flow_provider.py`）：`ExpenseFlowProvider` 抽象 + Mock 实现（恒成功，`instance_id` 由 `batch_id` 哈希派生、确定性可复现）+ 工厂，模式同验真 Provider；真实飞书接入只需新增 `FeishuExpenseFlowProvider` 并切 `.env EXPENSE_FLOW_PROVIDER=feishu`（需 `FEISHU_APP_ID`/`FEISHU_APP_SECRET`/`FEISHU_APPROVAL_CODE`），编排/UI/API 零改动
 - **验真**：`InvoiceVerifyProvider` 抽象 + Mock 实现（注册表命中 → 确定性结果；未命中 → 哈希伪随机 85% PASS）。接入百望云/诺诺时新增 Provider 实现即可，图节点零改动
 - **去重**：SQLite 台账，"确认提交报销"后才写入，避免查询污染连号/拆分判断；`file_sha256` 区分同文件重传
 - **RAG**：按「第X条」切分保引用完整 → `EMBEDDING_MODEL`（qwen3.7-text-embedding）+ **PostgreSQL pgvector** 语义检索 → jieba+BM25 → RRF 融合 → 引用编号来自切分元数据（非模型生成）；qa prompt v2 去模板化——直接自然作答，保留 [来源N] 引用与不足即拒答约束
@@ -142,16 +147,18 @@ START → intake → [intent 意图漏斗] → [route_entry] ─┬→ recognize
 ## 已知限制与注意事项
 
 1. **验真为 Mock**：结果显式标注，不代表真实真伪。接入真实平台需企业资质与付费开通。
-2. **知识库为合成语料**：`knowledge/` 按三层组织——`national/`（国家法规）、`local/`（地方细则，上海示例）、`company/`（公司制度），均为节选/示例文档（部分条款已过时如旅客运输抵扣政策），生产使用前需替换为最新法规全文、所在地区真实细则与公司真实制度，并重建索引。
-3. **发票数据会发送至 DashScope API**（识票/嵌入/汇总）；业务数据存储在本地 SQLite 与自建 PostgreSQL。请勿上传真实敏感发票用于演示。
-4. **token 上限为字符估算**（无 Qwen 本地 tokenizer），按保守口径设定（CJK≈1 token/字）；`context.token_budget` 可在 config.yaml 调整。
-5. **pgvector 链路需在有 PostgreSQL 的环境验收**：本仓库 CI 无 PG，`docker compose up -d` 后运行 `uv run pytest --override-ini addopts="-m integration"` 验证 RAG 检索与记忆召回。
-6. `samples/` 中的 PNG 已 gitignore；**真实发票严禁提交仓库**。
-7. **合成样本准确率偏高**：真实发票的盖章/折痕/拍照光斑会降低识别率，上线验收请用脱敏真实发票复测；必要时在 Phase 2 引入 PaddleOCR 交叉验证。
+2. **飞书审批为 Mock 提交**：恒成功、返回模拟实例 ID（`mock-` 前缀），UI 有显式提示；真实接入需飞书自建应用（审批实例创建权限）与已发布的报销审批定义。
+3. **知识库为合成语料**：`knowledge/` 按三层组织——`national/`（国家法规）、`local/`（地方细则，上海示例）、`company/`（公司制度），均为节选/示例文档（部分条款已过时如旅客运输抵扣政策），生产使用前需替换为最新法规全文、所在地区真实细则与公司真实制度，并重建索引。
+4. **发票数据会发送至 DashScope API**（识票/嵌入/汇总）；业务数据存储在本地 SQLite 与自建 PostgreSQL。请勿上传真实敏感发票用于演示。
+5. **token 上限为字符估算**（无 Qwen 本地 tokenizer），按保守口径设定（CJK≈1 token/字）；`context.token_budget` 可在 config.yaml 调整。
+6. **pgvector 链路需在有 PostgreSQL 的环境验收**：本仓库 CI 无 PG，`docker compose up -d` 后运行 `uv run pytest --override-ini addopts="-m integration"` 验证 RAG 检索与记忆召回。
+7. `samples/` 中的 PNG 已 gitignore；**真实发票严禁提交仓库**。
+8. **合成样本准确率偏高**：真实发票的盖章/折痕/拍照光斑会降低识别率，上线验收请用脱敏真实发票复测；必要时在 Phase 2 引入 PaddleOCR 交叉验证。
 
 ## Phase 2 路线（未实现）
 
 - PaddleOCR 交叉验证、DashScope gte-rerank 精排
 - 验真接入百望云/诺诺真实 API
-- 企业微信/钉钉/飞书机器人接入、批量异步处理
+- 飞书审批真实凭证接入（`FeishuExpenseFlowProvider`，Provider 抽象与 `.env` 配置已就位）；飞书机器人消息入口、审批回调状态同步
+- 企业微信/钉钉机器人接入、批量异步处理（轻量识票路径：批量场景跳过 finalize/RAG，减少每张的额外 LLM 调用）
 - PG 重启后 checkpointer 长驻连接自动重连/连接池（当前运行时显式报错，重启进程即恢复）
