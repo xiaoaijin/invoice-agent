@@ -239,6 +239,91 @@ class TestGraphFlow:
         assert state["answer"] == "你好，我是报销助手"
         assert state["intent"]["retrieval_type"] == "chat"
 
+    def test_invoice_without_question_skips_retrieval(self, tmp_path, monkeypatch):
+        """识票链路无提问 → route_after_risk 跳过检索直达 finalize（合规校验不受影响）。"""
+        from invoice_agent.graph import nodes
+
+        monkeypatch.setattr(nodes.intake, "intake", lambda state: {"page_images": ["x"]})
+        monkeypatch.setattr(
+            nodes.recognize,
+            "recognize",
+            lambda state: {"invoice": make_invoice(), "extract_error": None, "recognize_retry": 0},
+        )
+        _patch_config(monkeypatch, tmp_path)
+        import invoice_agent.graph.nodes.answer as answer_mod
+
+        retrieve_calls = {"n": 0}
+
+        def retrieve_docs(state):
+            retrieve_calls["n"] += 1
+            return {"rag_chunks": []}
+
+        monkeypatch.setattr(answer_mod, "retrieve_docs", retrieve_docs)
+        monkeypatch.setattr(nodes.answer, "finalize", lambda state: {"answer": "OK"})
+        g = _fresh_graph()
+        state = g.invoke(
+            {"session_id": "t-noq", "file_path": "x.png"},
+            config={"configurable": {"thread_id": "t-noq"}},
+        )
+        assert retrieve_calls["n"] == 0  # 无提问不检索
+        assert state["invoice"].invoice_number == "50000001"
+        assert state["verification"] is not None  # 验真/风控等合规校验完整执行
+        assert isinstance(state["risk_findings"], list)
+        assert state["answer"] == "OK"
+
+    def test_invoice_with_question_still_retrieves(self, tmp_path, monkeypatch):
+        """识票链路有合规类提问 → route_after_risk 仍走检索（政策依据需要引用）。"""
+        from invoice_agent.graph import nodes
+
+        monkeypatch.setattr(nodes.intake, "intake", lambda state: {"page_images": ["x"]})
+        monkeypatch.setattr(
+            nodes.recognize,
+            "recognize",
+            lambda state: {"invoice": make_invoice(), "extract_error": None, "recognize_retry": 0},
+        )
+        _patch_config(monkeypatch, tmp_path)
+        import invoice_agent.graph.nodes.answer as answer_mod
+
+        retrieve_calls = {"n": 0}
+
+        def retrieve_docs(state):
+            retrieve_calls["n"] += 1
+            return {"rag_chunks": []}
+
+        monkeypatch.setattr(answer_mod, "retrieve_docs", retrieve_docs)
+        monkeypatch.setattr(nodes.answer, "finalize", lambda state: {"answer": "OK"})
+        g = _fresh_graph()
+        g.invoke(
+            {"session_id": "t-withq", "file_path": "x.png", "user_question": "能报销吗"},
+            config={"configurable": {"thread_id": "t-withq"}},
+        )
+        assert retrieve_calls["n"] == 1  # 有提问且意图为 new_question → 检索
+
+    def test_no_retrieval_intent_skips_retrieval(self, tmp_path, monkeypatch):
+        """纯提问命中免检索关键词 → 意图判 no_retrieval → 跳过检索直接 finalize（keyword 层，零 LLM）。"""
+        import invoice_agent.graph.nodes.answer as answer_mod
+        from invoice_agent.graph import nodes
+        from invoice_agent.graph.nodes import intent as intent_mod
+
+        retrieve_calls = {"n": 0}
+
+        def retrieve_docs(state):
+            retrieve_calls["n"] += 1
+            return {"rag_chunks": []}
+
+        monkeypatch.setattr(answer_mod, "retrieve_docs", retrieve_docs)
+        monkeypatch.setattr(nodes.answer, "finalize", lambda state: {"answer": "好的，重复一遍……"})
+        monkeypatch.setattr(intent_mod, "default_llm_fn", lambda: None)
+        _patch_config(monkeypatch, tmp_path)
+        g = _fresh_graph()
+        state = g.invoke(
+            {"session_id": "t-nore", "file_path": None, "user_question": "再说一遍"},
+            config={"configurable": {"thread_id": "t-nore"}},
+        )
+        assert retrieve_calls["n"] == 0
+        assert state["intent"]["retrieval_type"] == "no_retrieval"
+        assert state["intent"]["source"] == "keyword"
+
 
 class TestFinalizePromptParams:
     def test_qa_placeholder_filled_into_system(self, monkeypatch):
@@ -271,6 +356,93 @@ class TestFinalizePromptParams:
         assert "（未检索到相关条款）" in system_text
         assert "## 用户问题" not in human_text  # 问题已入 system，human 不重复
         assert "## 参考条款" not in human_text
+
+    def test_output_rule_invoice_without_chunks(self, monkeypatch):
+        """有票无 chunks（免检索/检索降级）：不要求政策依据章节，改为基于风控的合规结论。"""
+        from langchain_core.messages import AIMessage
+
+        import invoice_agent.graph.nodes.answer as answer_mod
+
+        captured = {}
+
+        class FakeModel:
+            def invoke(self, messages):
+                captured["messages"] = messages
+                return AIMessage(content="测试回答")
+
+        monkeypatch.setattr(answer_mod, "get_chat_model", lambda: FakeModel())
+        state = {
+            "session_id": "t-rule-inv",
+            "invoice": make_invoice(),
+            "user_question": "能报销吗",
+            "rag_chunks": [],
+            "chat_history": [],
+        }
+        answer_mod.finalize(state)
+        human_text = captured["messages"][-1].content
+        assert "政策依据（[来源N] 引用列表）" not in human_text
+        assert "合规结论" in human_text
+        assert "禁止输出 [来源N] 引用标注" in human_text
+
+    def test_output_rule_question_without_chunks_bans_citations(self, monkeypatch):
+        """无票无 chunks（免检索/闲聊纯问答）：显式禁用 [来源N] 引用标注。"""
+        from langchain_core.messages import AIMessage
+
+        import invoice_agent.graph.nodes.answer as answer_mod
+
+        captured = {}
+
+        class FakeModel:
+            def invoke(self, messages):
+                captured["messages"] = messages
+                return AIMessage(content="测试回答")
+
+        monkeypatch.setattr(answer_mod, "get_chat_model", lambda: FakeModel())
+        state = {
+            "session_id": "t-rule-qa",
+            "user_question": "再说一遍",
+            "rag_chunks": [],
+            "chat_history": [],
+        }
+        answer_mod.finalize(state)
+        human_text = captured["messages"][-1].content
+        assert "不适用 system prompt 的 [来源N] 引用标注要求" in human_text
+        assert "标注 [来源N] 引用" not in human_text
+
+    def test_output_rule_with_chunks_keeps_citations(self, monkeypatch):
+        """有 chunks（无论有票无票）：维持 [来源N] 引用要求不变。"""
+        from langchain_core.messages import AIMessage
+
+        import invoice_agent.graph.nodes.answer as answer_mod
+
+        for invoice in (make_invoice(), None):
+            captured: dict = {}
+
+            def make_model(captured=captured):
+                class FakeModel:
+                    def invoke(self, messages):
+                        captured["messages"] = messages
+                        return AIMessage(content="测试回答")
+
+                return FakeModel()
+
+            monkeypatch.setattr(answer_mod, "get_chat_model", lambda: make_model())
+            monkeypatch.setattr(
+                answer_mod, "format_chunks_for_prompt", lambda chunks: "[1] 假条款"
+            )
+            state = {
+                "session_id": "t-rule-chunks",
+                "invoice": invoice,
+                "user_question": "餐饮票能抵扣吗" if invoice is None else "能报销吗",
+                "rag_chunks": [{"fake": "chunk"}],
+                "chat_history": [],
+            }
+            answer_mod.finalize(state)
+            human_text = captured["messages"][-1].content
+            if invoice is not None:
+                assert "政策依据（[来源N] 引用列表）" in human_text
+            else:
+                assert "标注 [来源N] 引用" in human_text
 
     def test_query_rewrite_placeholder_filled_into_system(self, monkeypatch):
         """query_rewrite v3 参数化模板：对话/领域/查询填入 system prompt。"""

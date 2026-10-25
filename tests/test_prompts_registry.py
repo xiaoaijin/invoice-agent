@@ -304,7 +304,7 @@ class TestRealPromptsDir:
         assert "{query}" in rewrite.text
         intent_prompt = registry.get("intent")
         assert intent_prompt.name == "intent"
-        assert intent_prompt.version == "v2"
+        assert intent_prompt.version == "v3"  # v3 新增 no_retrieval 检索类型，占位符与 v2 一致
         assert "{chat_history}" in intent_prompt.text
         assert "{user_input}" in intent_prompt.text
         for name, placeholders, expected in (

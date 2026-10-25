@@ -51,6 +51,7 @@ def _build_query(state: AgentState) -> str:
             parts.append(f"用户上一问题：{prev}")
         parts.append(f"用户问题：{question}")
     if not parts:
+        # 图内已不可达（无提问时 route_after_risk 不再进检索），兜底 query 仅服务节点直测
         parts.append("发票报销相关规定")
     query = "；".join(parts)
     # 历史教训召回：相似问题曾因检索不足被自评点名，本次检索提前补相关方向
@@ -279,19 +280,37 @@ def finalize(state: AgentState) -> dict:
             except Exception as exc:  # noqa: BLE001 — 教训是增强项，失败不阻塞回答
                 logger.warning("答案教训召回失败（忽略）：%s", exc)
 
-        # 意图区分：有发票才输出查验类章节；纯政策问答直接自然作答，不做格式化模板
-        if invoice is not None:
+        # 意图 × 检索结果四分支：有票输出查验类章节；无票纯问答自然作答。
+        # 无 chunks 时（免检索意图/检索降级）禁止 [来源N] 引用要求——qa prompt 要求编号取自
+        # 参考条款元数据、禁止编造，无来源仍强制引用会逼模型编造引用。
+        if invoice is not None and chunks:
             output_rule = (
                 "请按以下结构输出 Markdown：发票概览 / 验真结论 / 重复性 / 风险提示 / "
                 "政策依据（[来源N] 引用列表）。"
                 '结合对话历史理解追问（如"那出租车票呢"指上一问题中的票据类型）。'
             )
-        else:
+        elif invoice is not None:
+            output_rule = (
+                "请按以下结构输出 Markdown：发票概览 / 验真结论 / 重复性 / 风险提示 / 合规结论。"
+                "合规结论基于上述验真结果、重复性检查与风控预警给出；"
+                "本次未检索到政策条款原文，禁止输出 [来源N] 引用标注与「政策依据」章节，"
+                "如需政策原文支撑请提示用户补充提问。"
+                '结合对话历史理解追问（如"那出租车票呢"指上一问题中的票据类型）。'
+            )
+        elif chunks:
             output_rule = (
                 "本次未上传发票，属于纯政策问答：请直接、自然地回答用户问题本身，"
                 "不要套用任何固定章节模板，禁止输出发票概览 / 验真结论 / 重复性 / 风险提示"
                 "等发票查验类内容，也不要声明「未提供发票」；"
                 "政策结论按 system prompt 要求标注 [来源N] 引用。"
+                '结合对话历史理解追问（如"那出租车票呢"指上一问题中的票据类型）。'
+            )
+        else:
+            output_rule = (
+                "本次未上传发票，属于纯问答：请直接、自然地回答用户问题本身，"
+                "不要套用任何固定章节模板，禁止输出发票概览 / 验真结论 / 重复性 / 风险提示"
+                "等发票查验类内容，也不要声明「未提供发票」；"
+                "本次回答不适用 system prompt 的 [来源N] 引用标注要求，禁止输出任何引用标注。"
                 '结合对话历史理解追问（如"那出租车票呢"指上一问题中的票据类型）。'
             )
         prompt_text = "\n\n".join(context_parts) + "\n\n" + output_rule

@@ -1,6 +1,6 @@
 """意图识别节点：关键词 → 正则 → LLM 兜底的漏斗分类。
 
-输出两层意图：检索类型（新问题/追问/闲聊）+ 业务领域标签。
+输出两层意图：检索类型（新问题/追问/闲聊/免检索）+ 业务领域标签。
 前几层为纯字符串匹配（零成本同步），仅都未定性时才调 LLM；
 LLM 失败/关闭均静默降级为默认意图，不阻塞主流程。
 """
@@ -28,13 +28,13 @@ _FOLLOW_UP_PATTERNS = (
     re.compile(r"^(再|重新|补充)(说|讲|答|问)"),
 )
 
-_VALID_RETRIEVAL_TYPES = {"new_question", "follow_up", "chat"}
+_VALID_RETRIEVAL_TYPES = {"new_question", "follow_up", "chat", "no_retrieval"}
 
 
 class IntentResult(BaseModel):
     """意图识别结果（漏斗产出）。"""
 
-    retrieval_type: Literal["new_question", "follow_up", "chat"] = "new_question"
+    retrieval_type: Literal["new_question", "follow_up", "chat", "no_retrieval"] = "new_question"
     domain: str = "policy"  # policy/header/deduction/reimburse/verify/chat
     source: str = "default"  # 溯源：keyword | regex | rule | llm | default
 
@@ -58,6 +58,11 @@ def _classify(question: str, history: list[dict], cfg: IntentConfig) -> IntentRe
     domain = _match_domain(q, cfg.domain_keywords)
     if any(kw in q for kw in cfg.chat_keywords):
         return IntentResult(retrieval_type="chat", domain=domain or "chat", source="keyword")
+    # 第 1.5 层：免检索关键词——须置于追问正则之前（刻意层序）：「再说一遍」命中追问正则
+    # 的 ^(再|重新|补充)(说…) 前缀，放后面会被吞成 follow_up 反而触发检索。
+    # 代价：首轮无上文时命中也判 no_retrieval（finalize 自然作答），与 chat 层不要求上文的现状一致。
+    if any(kw in q for kw in cfg.no_retrieval_keywords):
+        return IntentResult(retrieval_type="no_retrieval", domain=domain, source="keyword")
     # 第 2 层：追问正则（需有上文——首轮无指代对象，追问判定无消解价值）
     if history and any(p.search(q) for p in _FOLLOW_UP_PATTERNS):
         return IntentResult(retrieval_type="follow_up", domain=domain, source="regex")

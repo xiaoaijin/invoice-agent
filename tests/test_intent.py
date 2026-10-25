@@ -57,6 +57,39 @@ class TestKeywordLayer:
         assert no_llm["n"] == 0
 
 
+class TestNoRetrievalKeywordLayer:
+    def test_keyword_hits_with_history(self, no_llm):
+        r = _classify("刚才的结论再说一遍", HISTORY, _cfg())
+        assert r.retrieval_type == "no_retrieval"
+        assert r.source == "keyword"
+        assert no_llm["n"] == 0
+
+    def test_keyword_hits_first_turn(self, no_llm):
+        """无上文命中也判 no_retrieval（与 chat 层不要求上文的现状一致）。"""
+        r = _classify("再说一遍", [], _cfg())
+        assert r.retrieval_type == "no_retrieval"
+        assert r.source == "keyword"
+        assert no_llm["n"] == 0
+
+    def test_keyword_with_domain_tag(self, no_llm):
+        r = _classify("重复一遍刚才的报销流程", HISTORY, _cfg())
+        assert r.retrieval_type == "no_retrieval"
+        assert r.domain == "reimburse"
+        assert no_llm["n"] == 0
+
+    def test_no_false_positive_on_real_question(self, no_llm):
+        """未命中关键词的真实问题不被误伤，且不被追问正则抢走（「再说」开头但含新诉求）。"""
+        r = _classify("再说一下报销流程", HISTORY, _cfg())
+        assert r.retrieval_type == "follow_up"
+        assert no_llm["n"] == 0
+
+    def test_layer_order_beats_follow_up_regex(self, no_llm):
+        """层序护栏：「再说一遍」命中追问正则 ^(再|重新|补充)(说…) 前缀，但免检索层在前。"""
+        r = _classify("再说一遍", HISTORY, _cfg())
+        assert r.retrieval_type == "no_retrieval"
+        assert no_llm["n"] == 0
+
+
 class TestRegexLayer:
     def test_prefix_follow_up_with_history(self, no_llm):
         r = _classify("那出租车票呢", HISTORY, _cfg())
@@ -104,6 +137,17 @@ class TestLlmFallback:
         r = _classify("餐饮发票全额抵扣吗", HISTORY, _cfg())
         assert r.retrieval_type == "follow_up"
         assert r.domain == "deduction"
+        assert r.source == "llm"
+
+    def test_llm_no_retrieval_parsed(self, monkeypatch):
+        monkeypatch.setattr(
+            intent_mod,
+            "default_llm_fn",
+            lambda: lambda m: '{"retrieval_type": "no_retrieval", "domain": "reimburse"}',
+        )
+        r = _classify("把要点总结一下", HISTORY, _cfg())
+        assert r.retrieval_type == "no_retrieval"
+        assert r.domain == "reimburse"
         assert r.source == "llm"
 
     def test_placeholder_template_filled_into_system(self, monkeypatch):
@@ -199,6 +243,14 @@ class TestRouteEntryChatShortCircuit:
     def test_chat_routes_to_finalize(self):
         state = {"user_question": "你好", "intent": {"retrieval_type": "chat"}}
         assert route_entry(state) == "finalize"
+
+    def test_no_retrieval_routes_to_finalize(self):
+        state = {"user_question": "再说一遍", "intent": {"retrieval_type": "no_retrieval"}}
+        assert route_entry(state) == "finalize"
+
+    def test_file_takes_precedence_over_no_retrieval(self):
+        state = {"file_path": "x.png", "intent": {"retrieval_type": "no_retrieval"}}
+        assert route_entry(state) == "recognize"
 
     def test_follow_up_routes_to_retrieve(self):
         state = {"user_question": "那它呢", "intent": {"retrieval_type": "follow_up"}}

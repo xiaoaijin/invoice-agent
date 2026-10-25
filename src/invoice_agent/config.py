@@ -112,6 +112,9 @@ class IntentConfig(BaseModel):
     chat_keywords: list[str] = Field(
         default_factory=lambda: ["你好", "在吗", "谢谢", "辛苦", "再见", "你是谁", "嗨"]
     )  # 寒暄/闲聊关键词（子串匹配）
+    no_retrieval_keywords: list[str] = Field(
+        default_factory=lambda: ["再说一遍", "再重复一遍", "重复一遍", "再讲一遍"]
+    )  # 免检索关键词：答案完全由对话上文直接可得的纯复述请求（子串匹配，表须极窄防误伤）
     domain_keywords: dict[str, list[str]] = Field(
         default_factory=lambda: {
             "policy": ["政策", "规定", "文件", "税法", "标准"],

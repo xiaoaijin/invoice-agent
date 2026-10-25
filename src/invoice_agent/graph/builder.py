@@ -2,15 +2,16 @@
 
 流程：
 START → intake → intent → route_entry ─┬─ 有文件 → recognize ⇄ check_extract（失败重试/降级）┐
-                                       │                                                  ├→ (verify ∥ dedup) → risk → risk_review ┐
-                                       └─ 仅提问（闲聊短路 → finalize）→ retrieve_docs ────┘                                          │
+                                       │                                                  ├→ (verify ∥ dedup) → risk → risk_review ─┐
+                                       └─ 仅提问（闲聊/免检索短路 → finalize）→ retrieve_docs ────┘                                   │
                                                 ↓                                                                                    │
-                                             retrieve_docs ←─────────────────────────────────────────────────────────────────────────┘
+                                             retrieve_docs ←── route_after_risk（需政策依据才检索，其余直达 finalize）←────────────────┘
                                                 ↓                              ↑
                                              finalize ⇄ critic_answer ─┬─ 通过 → END
                                                 ↑                      └─ 其余不通过（≤max_retries）→ finalize 重生成
                                                 └────────────────────────────┘
 
+检索按需触发：无提问或意图为 chat/no_retrieval 时不调用 RAG（合规校验由 verify/dedup/risk 承担）；
 verify 与 dedup 互不依赖（都只读 invoice），同 superstep 并行后 join 到 risk；
 risk 的 R002 规则依赖 dedup 的 duplicate_hits，故 risk/risk_review 保持串行。
 """
@@ -68,7 +69,13 @@ def build_graph():
     # verify 与 dedup 都只读 invoice、写字段互不相交，可同 superstep 并行；join 后进 risk
     g.add_edge(["verify", "dedup"], "risk")
     g.add_edge("risk", "risk_review")
-    g.add_edge("risk_review", "retrieve_docs")
+    # 检索按需触发：识票后无提问/闲聊/免检索意图直达 finalize（合规校验由 verify/dedup/risk 承担）；
+    # 需要政策依据（有提问且意图为 new_question/follow_up）才走 retrieve_docs
+    g.add_conditional_edges(
+        "risk_review",
+        route.route_after_risk,
+        {"retrieve_docs": "retrieve_docs", "finalize": "finalize"},
+    )
     g.add_edge("retrieve_docs", "finalize")
     # 回答自评：不通过 → finalize 带反馈重生成（有界）；通过/耗尽 → END
     # （检索不足类问题只落教训库，query 改写已前置到首检、由意图驱动，不再回环重检）
