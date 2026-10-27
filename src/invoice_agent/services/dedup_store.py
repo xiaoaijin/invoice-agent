@@ -46,6 +46,16 @@ CREATE TABLE IF NOT EXISTS reimbursement_batches (
     status TEXT NOT NULL DEFAULT 'submitted',
     submitted_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS pending_batches (
+    batch_id TEXT PRIMARY KEY,
+    batch_json TEXT NOT NULL,         -- ReimburseBatch 完整 JSON（confirm 唯一真相源，防篡改）
+    result_json TEXT,                 -- submit 成功后回写的 SubmissionResult JSON（幂等锚点，可空）
+    title TEXT NOT NULL,
+    total_amount REAL NOT NULL,
+    item_count INTEGER NOT NULL,
+    created_at TEXT NOT NULL          -- ISO 时间戳，过期判定用
+);
 """
 
 # 老库幂等迁移：reimbursements 追加的可空列（SQLite 无 ADD COLUMN IF NOT EXISTS）
@@ -229,6 +239,73 @@ class DedupStore:
             rows = conn.execute(
                 "SELECT * FROM reimbursements WHERE batch_id = ? ORDER BY id",
                 (batch_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---- 待确认批次（API 两步提交：preview 落 pending，confirm 才提交并写台账） ----
+
+    def save_pending_batch(self, batch: ReimburseBatch) -> None:
+        """待确认批次落库（INSERT OR REPLACE）；pending 不写 reimbursements，不参与查重。"""
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO pending_batches "
+                "(batch_id, batch_json, result_json, title, total_amount, item_count, created_at) "
+                "VALUES (?,?,NULL,?,?,?,?)",
+                (
+                    batch.batch_id,
+                    batch.model_dump_json(),
+                    batch.title,
+                    batch.total_amount,
+                    len(batch.items),
+                    datetime.now().isoformat(),
+                ),
+            )
+
+    def get_pending_batch(self, batch_id: str) -> ReimburseBatch | None:
+        """读待确认批次（batch_json 反序列化）；不存在返回 None。"""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT batch_json FROM pending_batches WHERE batch_id = ?", (batch_id,)
+            ).fetchone()
+        return None if row is None else ReimburseBatch.model_validate_json(row["batch_json"])
+
+    def get_pending_created_at(self, batch_id: str) -> datetime | None:
+        """pending 批次的落库时间（过期判定用）；不存在返回 None。"""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT created_at FROM pending_batches WHERE batch_id = ?", (batch_id,)
+            ).fetchone()
+        return None if row is None else datetime.fromisoformat(row["created_at"])
+
+    def mark_pending_submitted(self, batch_id: str, result: SubmissionResult) -> None:
+        """回写提交结果（幂等锚点）：落台账失败后重试 confirm 可跳过 provider 防重复建单。"""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE pending_batches SET result_json = ? WHERE batch_id = ?",
+                (result.model_dump_json(), batch_id),
+            )
+
+    def get_pending_result(self, batch_id: str) -> SubmissionResult | None:
+        """已回写的提交结果；未提交过（或行不存在）返回 None。"""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT result_json FROM pending_batches WHERE batch_id = ?", (batch_id,)
+            ).fetchone()
+        if row is None or row["result_json"] is None:
+            return None
+        return SubmissionResult.model_validate_json(row["result_json"])
+
+    def delete_pending_batch(self, batch_id: str) -> None:
+        with self._conn() as conn:
+            conn.execute("DELETE FROM pending_batches WHERE batch_id = ?", (batch_id,))
+
+    def list_pending_batches(self, limit: int = 20) -> list[dict]:
+        """待确认批次列表（供人工/运维查看，不含完整批次 JSON）。"""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT batch_id, title, total_amount, item_count, created_at "
+                "FROM pending_batches ORDER BY created_at DESC LIMIT ?",
+                (limit,),
             ).fetchall()
         return [dict(r) for r in rows]
 

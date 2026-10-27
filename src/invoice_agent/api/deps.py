@@ -8,11 +8,18 @@ from pathlib import Path
 from invoice_agent.config import get_app_config
 from invoice_agent.monitoring.store import MonitorStore
 from invoice_agent.services.conversation_store import ConversationStore
+from invoice_agent.services.dedup_store import DedupStore
 
 
 @lru_cache
 def get_monitor_store() -> MonitorStore:
     return MonitorStore(get_app_config().monitoring_db_path)
+
+
+@lru_cache
+def get_dedup_store() -> DedupStore:
+    """去重/台账/待确认批次共用的 SQLite 库（进程内单例，测试中 cache_clear 隔离）。"""
+    return DedupStore(get_app_config().db_path)
 
 
 @lru_cache

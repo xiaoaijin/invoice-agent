@@ -86,10 +86,11 @@ uv run invoice-agent serve --host 127.0.0.1 --port 8000   # FastAPI/uvicorn，�
 | `GET /chat/{session_id}/history` | 会话历史（与 UI 的 `data/chat_history.db` 互通） |
 | `POST /chat/stream` | SSE 流式对话（`node`/`token`/`done` 三类事件） |
 | `POST /reimbursements/preview` | multipart 多文件上传（`files`，可选 `title`）→ 批量识别 + 分类统计预览 JSON（单张失败不中断，见 `items[].error`；单次 ≤50 个文件） |
-| `POST /reimbursements/submit` | `{"batch"}`（preview 返回的批次，可剔除条目后回传）→ 提交审批流程并写台账，返回 `instance_id` |
+| `GET /reimbursements/pending` | 待确认批次列表（两步提交的人工审核入口） |
+| `POST /reimbursements/{batch_id}/confirm` | 人工确认后提交审批流程并写台账，返回 `instance_id`；请求体 `{"exclude_numbers": [...]}` 可选（剔除个别发票，服务端重算合计）。批次内容只认 preview 落下的服务端待确认存储（防篡改） |
 | `GET /runs/{run_id}` | 查监控 run 明细（节点时间线 + LLM 调用级 token/成本/prompt 版本） |
 
-错误约定：LLM/PG 失败在节点内静默降级返回 200（业务结果含降级提示）；文件超大小上限 413、类型不符 415、run 不存在 404、服务未配置（如缺 API key）503。
+错误约定：LLM/PG 失败在节点内静默降级返回 200（业务结果含降级提示）；文件超大小上限 413、类型不符 415、run 不存在 404、待确认批次不存在 404 / 已过期 410（超 `reimburse.pending_expire_days` 天，需重新 preview）、服务未配置（如缺 API key）503。
 
 > **部署约束**：必须**单 worker** 部署（`serve` 已固定 `workers=1`）——监控/台账/会话历史为 SQLite 文件库 + BM25 进程内索引，不兼容多 worker。checkpointer 后端可配（`config.yaml checkpointer.backend`）：`postgres` 时会话状态落 PG，跨进程/跨重启可恢复（PG 不可用则启动 fail-fast）；默认 `memory` 为进程内。跨重启历史恢复走 `GET /chat/{id}/history`。每个响应带的 `run_id` 可用于 `GET /runs/{id}` 追溯，也是后续异步任务扩展（202 + 轮询）的预留锚点。
 
@@ -128,7 +129,7 @@ START → intake → [intent 意图漏斗] → [route_entry] ─┬→ recognize
 ```
 
 - **识票**：视觉模型 `MODEL_VISION` + `with_structured_output(InvoiceData)`，温度 0，缺失字段填 null 禁止编造；字段级 LLM 自检可复用提取重试边（`feedback.field_check`）；recognize v3 一并输出费用类别 `expense_category`（无法确定填「其他」）
-- **报销批量提交**（`services/reimburse_flow.py`）：不改动单票 LangGraph 图，service 层逐张调 `runner.iter_run`（每张独立 thread_id，识票重试/验真/查重/风控全部复用），聚合层调用 `rules/expense_category.py` 关键词规则兜底（模型输出「其他」时修正）；`build_summary` 支持按发票号剔除重算。台账侧 `reimbursement_batches` 批次表 + `reimbursements.batch_id`/`expense_category` 列（老库经 `DedupStore._ensure_columns` 幂等迁移），批次提交即入台账、重复报销检测即刻生效
+- **报销批量提交**（`services/reimburse_flow.py`）：不改动单票 LangGraph 图，service 层逐张调 `runner.iter_run`（每张独立 thread_id，识票重试/验真/查重/风控全部复用），聚合层调用 `rules/expense_category.py` 关键词规则兜底（模型输出「其他」时修正）；`build_summary` 支持按发票号剔除重算。台账侧 `reimbursement_batches` 批次表 + `reimbursements.batch_id`/`expense_category` 列（老库经 `DedupStore._ensure_columns` 幂等迁移），批次提交即入台账、重复报销检测即刻生效。API 为两步提交：preview 落 `pending_batches` 待确认批次（不写台账），人工审核后 confirm 才提交审批并写台账（飞书审批提交前强制人工确认；provider 提交失败批次保留可重试，落台账失败可幂等重试、不重复建审批单）
 - **审批流程 Provider**（`services/expense_flow_provider.py`）：`ExpenseFlowProvider` 抽象 + Mock 实现（恒成功，`instance_id` 由 `batch_id` 哈希派生、确定性可复现）+ 工厂，模式同验真 Provider；真实飞书接入只需新增 `FeishuExpenseFlowProvider` 并切 `.env EXPENSE_FLOW_PROVIDER=feishu`（需 `FEISHU_APP_ID`/`FEISHU_APP_SECRET`/`FEISHU_APPROVAL_CODE`），编排/UI/API 零改动
 - **验真**：`InvoiceVerifyProvider` 抽象 + Mock 实现（注册表命中 → 确定性结果；未命中 → 哈希伪随机 85% PASS）。接入百望云/诺诺时新增 Provider 实现即可，图节点零改动
 - **去重**：SQLite 台账，"确认提交报销"后才写入，避免查询污染连号/拆分判断；`file_sha256` 区分同文件重传

@@ -3,7 +3,11 @@
 错误处理约定（业务节点内部已静默降级，故）：
 - LLM/PG/检索失败 → 200（answer 内含降级提示）
 - 文件超大小上限 → 413；扩展名不在白名单 → 415；请求体校验失败 → 422
-- run 不存在 → 404；服务未配置（缺 API key 等 RuntimeError）→ 503；未捕获 → 500
+- run 不存在 → 404；待确认批次不存在 → 404、已过期 → 410
+- 服务未配置（缺 API key 等 RuntimeError）→ 503；未捕获 → 500
+
+报销提交为两步：preview 落服务端待确认批次，人工审核后 confirm 才真正
+提交审批流并写台账（批次内容以服务端存储为准，防篡改）。
 """
 
 from __future__ import annotations
@@ -14,7 +18,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 from invoice_agent.api import deps
 from invoice_agent.api.schemas import (
@@ -23,16 +27,21 @@ from invoice_agent.api.schemas import (
     ChatRequest,
     ChatResponse,
     InvoiceResponse,
+    ReimburseConfirmRequest,
+    ReimburseConfirmResponse,
     ReimbursePreviewResponse,
-    ReimburseSubmitRequest,
-    ReimburseSubmitResponse,
     RunDetailResponse,
 )
 from invoice_agent.config import get_app_config
-from invoice_agent.models.reimburse import ReimburseBatch
 from invoice_agent.monitoring.setup import setup_logging
 from invoice_agent.runner import iter_run, run_stream
-from invoice_agent.services.reimburse_flow import run_batch, submit_batch
+from invoice_agent.services.reimburse_flow import (
+    PendingExpiredError,
+    PendingNotFoundError,
+    confirm_pending_batch,
+    run_batch,
+    save_pending,
+)
 
 DEFAULT_INVOICE_QUESTION = "这张发票能否报销？有什么风险？"
 MAX_BATCH_FILES = 50  # 单次批量报销的文件数上限（防误传与资源耗尽）
@@ -118,22 +127,42 @@ def create_app() -> FastAPI:
         files: list[UploadFile] = File(...),  # noqa: B008 — FastAPI 依赖注入惯用法
         title: str = Form(default=None),
     ) -> ReimbursePreviewResponse:
-        """多文件批量识别并分类统计（不落台账）；单张失败不中断，见 items[].error。"""
+        """多文件批量识别并分类统计，落服务端待确认批次（不提交、不写台账）。
+
+        单张失败不中断，见 items[].error；人工审核后凭 batch_id 调 confirm 提交。
+        """
         if len(files) > MAX_BATCH_FILES:
             raise HTTPException(413, f"单次最多 {MAX_BATCH_FILES} 个文件")
         paths = [_save_upload(f) for f in files]
         batch = run_batch(paths, title=title or None)
-        return ReimbursePreviewResponse(batch=batch.model_dump(mode="json"))
+        save_pending(batch, store=deps.get_dedup_store())
+        return ReimbursePreviewResponse(
+            batch_id=batch.batch_id, batch=batch.model_dump(mode="json")
+        )
 
-    @app.post("/reimbursements/submit", response_model=ReimburseSubmitResponse)
-    def submit_reimbursement(req: ReimburseSubmitRequest) -> ReimburseSubmitResponse:
-        """提交审批流程并写台账（去重即刻生效）；批次内容以请求体为准（可剔除条目）。"""
+    @app.get("/reimbursements/pending")
+    def list_pending_reimbursements() -> dict:
+        """待确认批次列表（跨重启可查，人工审核入口）。"""
+        return {"pending": deps.get_dedup_store().list_pending_batches()}
+
+    @app.post("/reimbursements/{batch_id}/confirm", response_model=ReimburseConfirmResponse)
+    def confirm_reimbursement(batch_id: str, req: ReimburseConfirmRequest) -> ReimburseConfirmResponse:
+        """人工确认后提交审批流程并写台账（去重即刻生效）。
+
+        批次内容只认服务端待确认存储（防篡改）；exclude_numbers 可剔除个别
+        发票（服务端重算合计）。provider 提交失败批次保留可重试。
+        """
         try:
-            batch = ReimburseBatch.model_validate(req.batch)
-        except ValidationError as exc:
-            raise HTTPException(422, f"batch 数据不合法：{exc.errors(include_url=False)[:3]}") from exc
-        result = submit_batch(batch)
-        return ReimburseSubmitResponse(
+            batch, result = confirm_pending_batch(
+                batch_id,
+                exclude_numbers=set(req.exclude_numbers),
+                store=deps.get_dedup_store(),
+            )
+        except PendingNotFoundError as exc:
+            raise HTTPException(404, f"{exc}（请先 POST /reimbursements/preview）") from exc
+        except PendingExpiredError as exc:
+            raise HTTPException(410, f"{exc}") from exc
+        return ReimburseConfirmResponse(
             batch_id=batch.batch_id, submission=result.model_dump(mode="json")
         )
 

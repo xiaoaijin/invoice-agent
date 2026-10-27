@@ -174,6 +174,7 @@ class ReimburseConfig(BaseModel):
     categories: list[str] = Field(
         default_factory=lambda: [c.value for c in ExpenseCategory]
     )  # 与 ExpenseCategory 枚举值保持一致（tests/test_expense_models.py 把关）
+    pending_expire_days: int = 3  # API 待确认批次过期天数（confirm 时校验，过期需重新 preview）
 
 
 class PathsConfig(BaseModel):

@@ -6,6 +6,7 @@ patch get_app_config）。
 """
 
 import json
+import sqlite3
 from datetime import date
 from pathlib import Path
 
@@ -92,11 +93,13 @@ def client(tmp_path: Path, monkeypatch):
     builder_mod.build_graph.cache_clear()
     api_deps.get_monitor_store.cache_clear()
     api_deps.get_conversation_store.cache_clear()
+    api_deps.get_dedup_store.cache_clear()
     yield TestClient(create_app()), captured
     config_mod.get_app_config.cache_clear()
     builder_mod.build_graph.cache_clear()
     api_deps.get_monitor_store.cache_clear()
     api_deps.get_conversation_store.cache_clear()
+    api_deps.get_dedup_store.cache_clear()
 
 
 def _png_bytes() -> bytes:
@@ -256,22 +259,27 @@ class TestErrorMapping:
         assert "DASHSCOPE_API_KEY" in resp.json()["detail"]
 
 
+def _preview(client, n_files: int = 1) -> dict:
+    return client.post(
+        "/reimbursements/preview",
+        files=[("files", (f"f{i}.png", _png_bytes(), "image/png")) for i in range(n_files)],
+    ).json()
+
+
 class TestReimbursements:
     def test_preview_happy_path(self, client):
-        """client fixture 已打桩全图节点，preview 走真实 run_batch 聚合。"""
+        """client fixture 已打桩全图节点，preview 走真实 run_batch 聚合并落待确认批次。"""
         c, _ = client
-        resp = c.post(
-            "/reimbursements/preview",
-            files=[
-                ("files", ("a.png", _png_bytes(), "image/png")),
-                ("files", ("b.png", _png_bytes(), "image/png")),
-            ],
-        )
-        assert resp.status_code == 200
-        batch = resp.json()["batch"]
+
+        body = _preview(c, 2)
+        assert body["batch_id"] == body["batch"]["batch_id"]
+        batch = body["batch"]
         assert len(batch["items"]) == 2
         assert batch["items"][0]["invoice"]["invoice_number"] == "50000001"
         assert batch["total_amount"] == pytest.approx(226.0)
+        # 待确认批次已落服务端存储
+        store = api_deps.get_dedup_store()
+        assert store.get_pending_batch(body["batch_id"]) is not None
 
     def test_preview_bad_extension_415(self, client):
         c, _ = client
@@ -292,28 +300,116 @@ class TestReimbursements:
         )
         assert resp.status_code == 413
 
-    def test_submit_writes_ledger(self, client):
+    def test_confirm_writes_ledger(self, client):
+        """preview → confirm 两步：确认才提交审批并写台账，pending 随之删除。"""
         c, _ = client
-        preview = c.post(
-            "/reimbursements/preview",
-            files=[("files", ("a.png", _png_bytes(), "image/png"))],
-        ).json()["batch"]
-        resp = c.post("/reimbursements/submit", json={"batch": preview})
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["batch_id"] == preview["batch_id"]
-        assert body["submission"]["instance_id"].startswith("mock-")
-        # 台账已写入（重复报销检测即刻生效）
         from invoice_agent.config import get_app_config
         from invoice_agent.services.dedup_store import DedupStore
 
+        body = _preview(c)
+        resp = c.post(f"/reimbursements/{body['batch_id']}/confirm", json={})
+        assert resp.status_code == 200
+        result = resp.json()
+        assert result["batch_id"] == body["batch_id"]
+        assert result["submission"]["instance_id"].startswith("mock-")
+        # 台账已写入（重复报销检测即刻生效），pending 已清理
         store = DedupStore(get_app_config().db_path)
-        assert store.get_batch(body["batch_id"]) is not None
+        assert store.get_batch(result["batch_id"]) is not None
+        assert store.get_pending_batch(result["batch_id"]) is None
+        assert len(store.find_duplicates("50000001", "91330100MA28YYYYYY", "other-sha")) == 1
 
-    def test_submit_invalid_batch_422(self, client):
+    def test_confirm_unknown_404(self, client):
         c, _ = client
-        resp = c.post(
-            "/reimbursements/submit",
-            json={"batch": {"batch_id": "x", "items": [{"nonsense": 1}]}},
-        )
-        assert resp.status_code == 422
+        resp = c.post("/reimbursements/nope/confirm", json={})
+        assert resp.status_code == 404
+        assert "preview" in resp.json()["detail"]
+
+    def test_confirm_expired_410(self, client):
+        """pending 过期（created_at 早于期限）→ 410 且批次被清理。"""
+        import sqlite3 as sqlite3_mod
+
+        c, _ = client
+        from invoice_agent.config import get_app_config
+
+        batch_id = _preview(c)["batch_id"]
+        db = get_app_config().db_path
+        with sqlite3_mod.connect(db) as conn:
+            conn.execute(
+                "UPDATE pending_batches SET created_at = ? WHERE batch_id = ?",
+                ("2020-01-01T00:00:00", batch_id),
+            )
+        resp = c.post(f"/reimbursements/{batch_id}/confirm", json={})
+        assert resp.status_code == 410
+        assert api_deps.get_dedup_store().get_pending_batch(batch_id) is None
+
+    def test_confirm_exclude_recalculates(self, client, monkeypatch):
+        """confirm 带 exclude_numbers：服务端重算合计，被排除的票不进台账。"""
+        from invoice_agent.graph import nodes
+
+        c, _ = client
+        from invoice_agent.config import get_app_config
+        from invoice_agent.services.dedup_store import DedupStore
+
+        # 打桩让两张票号码不同（默认桩恒返回 50000001，同号无法只排除一张）
+        numbers = iter(["70000001", "70000002"])
+
+        def two_invoices(state):
+            return {"invoice": make_invoice(invoice_number=next(numbers)), "extract_error": None, "recognize_retry": 0}
+
+        monkeypatch.setattr(nodes.recognize, "recognize", two_invoices)
+        batch_id = _preview(c, 2)["batch_id"]
+        resp = c.post(f"/reimbursements/{batch_id}/confirm", json={"exclude_numbers": ["70000001"]})
+        assert resp.status_code == 200
+        store = DedupStore(get_app_config().db_path)
+        assert resp.json()["submission"]["status"] == "submitted"
+        rows = store.batch_items(batch_id)
+        assert [r["invoice_number"] for r in rows] == ["70000002"]
+
+    def test_confirm_idempotent_after_store_failure(self, client, monkeypatch):
+        """落台账失败 → 异常上抛（HTTP 500 语义）、pending 保留；重试成功且 provider 只提交一次。"""
+        from invoice_agent.services.dedup_store import DedupStore
+        from invoice_agent.services.expense_flow_provider import MockExpenseFlowProvider
+
+        c, _ = client
+        batch_id = _preview(c)["batch_id"]
+
+        submits = {"n": 0}
+        orig_submit = MockExpenseFlowProvider.submit
+
+        def counting_submit(self, batch):
+            submits["n"] += 1
+            return orig_submit(self, batch)
+
+        monkeypatch.setattr(MockExpenseFlowProvider, "submit", counting_submit)
+        orig_save_batch = DedupStore.save_batch
+
+        def flaky_save_batch(self, batch, result):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(DedupStore, "save_batch", flaky_save_batch)
+        # 未捕获异常走全局 500；TestClient 默认 raise_server_exceptions 会原样上抛
+        with pytest.raises(sqlite3.OperationalError):
+            c.post(f"/reimbursements/{batch_id}/confirm", json={})
+        store = api_deps.get_dedup_store()
+        assert store.get_pending_batch(batch_id) is not None
+        assert store.get_pending_result(batch_id) is not None  # 幂等锚点已回写
+
+        monkeypatch.setattr(DedupStore, "save_batch", orig_save_batch)
+        resp = c.post(f"/reimbursements/{batch_id}/confirm", json={})
+        assert resp.status_code == 200
+        assert submits["n"] == 1  # 重试未再调 provider（不重复建审批单）
+        assert store.get_pending_batch(batch_id) is None
+
+    def test_list_pending(self, client):
+        c, _ = client
+        batch_id = _preview(c)["batch_id"]
+        pending = c.get("/reimbursements/pending").json()["pending"]
+        assert [p["batch_id"] for p in pending] == [batch_id]
+        c.post(f"/reimbursements/{batch_id}/confirm", json={})
+        assert c.get("/reimbursements/pending").json()["pending"] == []
+
+    def test_submit_endpoint_removed(self, client):
+        """旧的「回传整个 batch」提交口已移除（防篡改：批次只认服务端存储）。"""
+        c, _ = client
+        resp = c.post("/reimbursements/submit", json={"batch": {}})
+        assert resp.status_code == 404

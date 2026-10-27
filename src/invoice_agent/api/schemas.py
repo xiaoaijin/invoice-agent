@@ -49,17 +49,20 @@ class RunDetailResponse(BaseModel):
 
 
 class ReimbursePreviewResponse(BaseModel):
-    """批量报销预览：ReimburseBatch 的 JSON 形态（可剔除条目后回传 submit）。"""
+    """批量报销预览：批次落服务端待确认存储，凭 batch_id 走 confirm 两步提交。"""
 
+    batch_id: str  # 人工确认凭据：POST /reimbursements/{batch_id}/confirm
     batch: dict[str, Any]
 
 
-class ReimburseSubmitRequest(BaseModel):
-    batch: dict[str, Any]  # preview 返回的 batch（可按需剔除 items 后原样回传）
+class ReimburseConfirmRequest(BaseModel):
+    """确认提交：只允许传排除集合，批次内容以服务端待确认存储为准（防篡改）。"""
+
+    exclude_numbers: list[str] = Field(default_factory=list)  # 不纳入本次报销的发票号
 
     model_config = {"extra": "forbid"}
 
 
-class ReimburseSubmitResponse(BaseModel):
+class ReimburseConfirmResponse(BaseModel):
     batch_id: str
     submission: dict[str, Any]

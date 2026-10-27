@@ -1,6 +1,8 @@
 import hashlib
+import sqlite3
 from datetime import date, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,7 +16,15 @@ from invoice_agent.models.reimburse import (
 )
 from invoice_agent.models.risk import Finding, RiskLevel, VerificationResult
 from invoice_agent.services.dedup_store import DedupStore
-from invoice_agent.services.reimburse_flow import build_summary, run_batch, submit_batch
+from invoice_agent.services.reimburse_flow import (
+    PendingExpiredError,
+    PendingNotFoundError,
+    build_summary,
+    confirm_pending_batch,
+    run_batch,
+    save_pending,
+    submit_batch,
+)
 
 
 def make_invoice(number: str, amount: float = 113.0, **kw) -> InvoiceData:
@@ -208,3 +218,148 @@ class TestSubmitBatch:
         store = DedupStore(tmp_path / "t.db")
         submit_batch(batch, provider=_FakeProvider(), store=store)
         assert store.batch_items("b10") == []
+
+
+def make_batch(batch_id: str, numbers: list[str]) -> ReimburseBatch:
+    items = [
+        BatchItem(
+            file_name=n, file_sha256=hashlib.sha256(n.encode()).hexdigest(),
+            invoice=make_invoice(n, 100.0), category=ExpenseCategory.DINING,
+        )
+        for n in numbers
+    ]
+    return build_summary(items, batch_id=batch_id, title="T")
+
+
+class TestPendingStore:
+    def test_save_get_roundtrip(self, tmp_path):
+        """pending 往返保真（date 等字段经 JSON round-trip 后值相等）。"""
+        store = DedupStore(tmp_path / "t.db")
+        batch = make_batch("p1", ["10001"])
+        save_pending(batch, store=store)
+        loaded = store.get_pending_batch("p1")
+        assert loaded == batch
+        assert store.list_pending_batches()[0]["title"] == "T"
+
+    def test_get_missing_returns_none(self, tmp_path):
+        store = DedupStore(tmp_path / "t.db")
+        assert store.get_pending_batch("nope") is None
+        assert store.get_pending_result("nope") is None
+        assert store.get_pending_created_at("nope") is None
+
+    def test_mark_result_and_delete(self, tmp_path):
+        store = DedupStore(tmp_path / "t.db")
+        save_pending(make_batch("p2", ["10001"]), store=store)
+        result = SubmissionResult(
+            status="submitted", instance_id="i1", provider="fake", message="ok"
+        )
+        store.mark_pending_submitted("p2", result)
+        assert store.get_pending_result("p2").instance_id == "i1"
+        store.delete_pending_batch("p2")
+        assert store.get_pending_batch("p2") is None
+        assert store.list_pending_batches() == []
+
+
+class TestConfirmPendingBatch:
+    def test_confirm_submits_pending_batch(self, tmp_path):
+        """provider 收到的是服务端 pending 里那份批次（防篡改语义）。"""
+        store = DedupStore(tmp_path / "t.db")
+        save_pending(make_batch("c1", ["10001", "10002"]), store=store)
+        provider = _FakeProvider()
+        _, result = confirm_pending_batch("c1", provider=provider, store=store)
+        assert provider.submitted.batch_id == "c1"  # 提交的是服务端 pending 那份
+        assert provider.submitted.total_amount == pytest.approx(200.0)
+        assert result.instance_id == "fake-123"
+        assert store.get_batch("c1")["instance_id"] == "fake-123"
+        assert store.get_pending_batch("c1") is None  # 确认后 pending 删除
+        assert len(store.batch_items("c1")) == 2
+
+    def test_confirm_unknown_raises(self, tmp_path):
+        store = DedupStore(tmp_path / "t.db")
+        with pytest.raises(PendingNotFoundError):
+            confirm_pending_batch("nope", provider=_FakeProvider(), store=store)
+
+    def test_confirm_expired_deletes_and_raises(self, tmp_path, monkeypatch):
+        """过期批次删行并抛 PendingExpiredError，不提交 provider。"""
+        store = DedupStore(tmp_path / "t.db")
+        save_pending(make_batch("c2", ["10001"]), store=store)
+        monkeypatch.setattr(
+            flow_mod, "get_app_config",
+            lambda: SimpleNamespace(reimburse=SimpleNamespace(pending_expire_days=0)),
+        )
+        provider = _FakeProvider()
+        with pytest.raises(PendingExpiredError):
+            confirm_pending_batch("c2", provider=provider, store=store)
+        assert provider.submitted is None  # 未提交
+        assert store.get_pending_batch("c2") is None  # 已删行
+
+    def test_provider_failure_keeps_pending(self, tmp_path):
+        """provider.submit 抛异常：异常上抛，pending 保留可重试，台账无记录。"""
+        store = DedupStore(tmp_path / "t.db")
+        save_pending(make_batch("c3", ["10001"]), store=store)
+
+        class _BoomProvider:
+            name = "boom"
+
+            def submit(self, batch):
+                raise RuntimeError("飞书不可达")
+
+        with pytest.raises(RuntimeError, match="飞书不可达"):
+            confirm_pending_batch("c3", provider=_BoomProvider(), store=store)
+        assert store.get_pending_batch("c3") is not None
+        assert store.get_batch("c3") is None
+
+    def test_idempotent_retry_after_store_failure(self, tmp_path, monkeypatch):
+        """落台账失败：pending 保留且 result 已回写；重试 confirm 跳过 provider 直接落台账。"""
+        store = DedupStore(tmp_path / "t.db")
+        save_pending(make_batch("c4", ["10001"]), store=store)
+        provider = _FakeProvider()
+        submits = {"n": 0}
+        orig_submit = provider.submit
+
+        def counting_submit(batch):
+            submits["n"] += 1
+            return orig_submit(batch)
+
+        provider.submit = counting_submit
+        calls = {"n": 0}
+        orig_save_batch = store.save_batch
+
+        def flaky_save_batch(batch, result):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise sqlite3.OperationalError("disk I/O error")
+            orig_save_batch(batch, result)
+
+        monkeypatch.setattr(store, "save_batch", flaky_save_batch)
+        with pytest.raises(sqlite3.OperationalError):
+            confirm_pending_batch("c4", provider=provider, store=store)
+        assert store.get_pending_batch("c4") is not None
+        assert store.get_pending_result("c4") is not None  # 幂等锚点已回写
+
+        monkeypatch.setattr(store, "save_batch", orig_save_batch)
+        _, result = confirm_pending_batch("c4", provider=provider, store=store)
+        assert submits["n"] == 1  # 第二次未再调 provider（不重复建审批单）
+        assert result.instance_id == "fake-123"
+        assert store.get_batch("c4")["instance_id"] == "fake-123"
+        assert store.get_pending_batch("c4") is None
+
+    def test_exclude_numbers_removed_from_ledger(self, tmp_path):
+        """排除集合裁剪 items：被排除的票不进台账（先过滤再聚合）。"""
+        store = DedupStore(tmp_path / "t.db")
+        save_pending(make_batch("c5", ["10001", "10002"]), store=store)
+        new_batch, _ = confirm_pending_batch(
+            "c5", exclude_numbers={"10001"}, provider=_FakeProvider(), store=store
+        )
+        assert new_batch.total_amount == pytest.approx(100.0)
+        assert len(store.batch_items("c5")) == 1
+        assert store.batch_items("c5")[0]["invoice_number"] == "10002"
+
+    def test_exclude_all_raises(self, tmp_path):
+        store = DedupStore(tmp_path / "t.db")
+        save_pending(make_batch("c6", ["10001"]), store=store)
+        with pytest.raises(ValueError, match="排除后没有任何可提交"):
+            confirm_pending_batch(
+                "c6", exclude_numbers={"10001"}, provider=_FakeProvider(), store=store
+            )
+        assert store.get_pending_batch("c6") is not None  # 未提交未清理

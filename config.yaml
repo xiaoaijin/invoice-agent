@@ -44,6 +44,7 @@ reimburse:
     - "住宿"
     - "办公用品"
     - "其他"
+  pending_expire_days: 3         # API 待确认批次过期天数（confirm 时校验，过期需重新 preview）
 
 memory:
   enabled: true               # PG 不可用时自动降级为无长期记忆
